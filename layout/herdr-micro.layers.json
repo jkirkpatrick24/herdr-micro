@@ -1,0 +1,102 @@
+{
+  "keyboard": "creator_micro_v2",
+  "language": "us",
+  "layer": {
+    "id": 0,
+    "name": "HerderMicro",
+    "color": "#FF0000",
+    "layout": {
+      "encoders": [
+        [
+          {
+            "keycode": "KV_OAI_ENC_CC"
+          },
+          {
+            "keycode": "KV_OAI_ENC_CW"
+          },
+          {
+            "keycode": "KV_OAI_ENC_CLK"
+          }
+        ]
+      ],
+      "joystick": {
+        "type": "VENDOR",
+        "sectors": []
+      },
+      "base": [
+        [
+          {
+            "keycode": "KV_OAI_AG00"
+          },
+          {
+            "keycode": "KV_OAI_AG01"
+          }
+        ],
+        [
+          {
+            "keycode": "KV_OAI_AG02"
+          },
+          {
+            "keycode": "KV_OAI_AG03"
+          },
+          {
+            "keycode": "KV_OAI_AG04"
+          },
+          {
+            "keycode": "KV_OAI_AG05"
+          }
+        ],
+        [
+          {
+            "keycode": "KV_OAI_ACT06"
+          },
+          {
+            "keycode": "KV_OAI_ACT07"
+          },
+          {
+            "keycode": "KV_OAI_ACT08"
+          },
+          {
+            "keycode": "KV_OAI_ACT09"
+          }
+        ],
+        [
+          {
+            "keycode": "KV_OAI_ACT10"
+          },
+          {
+            "keycode": "KV_OAI_ACT11"
+          },
+          {
+            "keycode": "KV_OAI_ACT12"
+          }
+        ]
+      ]
+    },
+    "os": 0
+  },
+  "actions": [],
+  "multiactions": [],
+  "smartActions": [],
+  "actionGroups": [
+    {
+      "id": 0,
+      "name": "HerderMicro",
+      "actionIds": []
+    }
+  ],
+  "multiactionGroups": [
+    {
+      "id": 0,
+      "name": "HerderMicro",
+      "actionIds": []
+    }
+  ],
+  "smartActionGroups": [
+    {
+      "id": 0,
+      "name": "HerderMicro",
+      "actionIds": []
+    }
+  ]
+}

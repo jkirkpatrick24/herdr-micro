@@ -24,7 +24,7 @@ async function main(): Promise<void> {
   const counters: Counters = { eventsIn: 0, repaints: 0 };
 
   const controls = new PadControls(client, store, config.controls, log, (mode) => {
-    paint(pad.setAmbientLighting(ambientLighting(mode)), 'dial ring update', log);
+    paint(pad.setAmbientLighting(ambientLighting(config, mode)), 'dial ring update', log);
   });
 
   store.on('transition', (t) => {

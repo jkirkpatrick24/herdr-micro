@@ -98,7 +98,7 @@ export function wirePad(
     // paint the current state immediately rather than waiting for an event.
     paint(
       pad
-        .setAmbientLighting(ambientLighting(controls.dialMode))
+        .setAmbientLighting(ambientLighting(config, controls.dialMode))
         .then(() => pad.setThreadLighting(renderSlotLighting(store.view(), config))),
       'initial LED update',
       log,

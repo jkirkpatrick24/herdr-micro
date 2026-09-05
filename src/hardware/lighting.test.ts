@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'vitest';
 
-import { DEFAULT_CONFIG } from '../config.js';
+import { type Config, DEFAULT_CONFIG, DIAL_MODES, type UnderglowConfig } from '../config.js';
 import type { SlotView } from '../state/store.js';
 import { ambientLighting, renderSlotLighting } from './lighting.js';
 
@@ -13,6 +13,12 @@ function slot(index: number, status: SlotView['status']): SlotView {
     label: `agent ${index}`,
     status,
   };
+}
+
+const DIAL = DEFAULT_CONFIG.underglow.dial;
+
+function ringConfig(underglow: Partial<UnderglowConfig>): Config {
+  return { ...DEFAULT_CONFIG, underglow: { ...DEFAULT_CONFIG.underglow, ...underglow } };
 }
 
 /** An unoccupied slot's thread: no colour, no light, no animation. */
@@ -57,25 +63,44 @@ test('renderSlotLighting ignores slots past the six the pad has', () => {
   assert.equal(renderSlotLighting(view, DEFAULT_CONFIG).length, 6);
 });
 
-test('the workspaces ring is fully dark', () => {
-  const darkRing = { color: 0, brightness: 0, effect: 0, speed: 0, magic: 0 };
-  assert.deepEqual(ambientLighting('workspaces'), darkRing);
-  // The parameter defaults to this mode, so an absent argument lands here too.
-  assert.deepEqual(ambientLighting(), darkRing);
+test('every dial mode lights the ring in its own colour', () => {
+  const lit = { brightness: 0.5, effect: 1, speed: 0, magic: 0 };
+
+  assert.deepEqual(ambientLighting(DEFAULT_CONFIG, 'workspaces'), { color: 0x95bf47, ...lit });
+  assert.deepEqual(ambientLighting(DEFAULT_CONFIG, 'agents'), { color: 0x2c6ecb, ...lit });
+  assert.deepEqual(ambientLighting(DEFAULT_CONFIG, 'scroll'), { color: 0x9c6ade, ...lit });
+
+  // The parameter defaults to workspaces, so an absent argument lands there.
+  assert.deepEqual(ambientLighting(DEFAULT_CONFIG), { color: 0x95bf47, ...lit });
 });
 
-test('the agent and scroll rings are lit in their own colours', () => {
-  assert.deepEqual(ambientLighting('agents'), {
-    color: 0x2277ff,
-    brightness: 0.5,
+test('the ring follows the configured mode colours and brightness', () => {
+  const config = ringConfig({ brightness: 0.25, dial: { ...DIAL, agents: '#010203' } });
+
+  assert.deepEqual(ambientLighting(config, 'agents'), {
+    color: 0x010203,
+    brightness: 0.25,
     effect: 1,
     speed: 0,
     magic: 0,
   });
-  assert.deepEqual(ambientLighting('scroll'), {
-    color: 0xaa55ff,
-    brightness: 0.5,
-    effect: 1,
+});
+
+test('a static colour holds every mode and gives up the indicator', () => {
+  const config = ringConfig({ color: '#FF6600' });
+  const expected = { color: 0xff6600, brightness: 0.5, effect: 1, speed: 0, magic: 0 };
+
+  for (const mode of DIAL_MODES) assert.deepEqual(ambientLighting(config, mode), expected);
+});
+
+/** Black is off rather than a shade, so a mode can still be given no ring. */
+test('a colour of black darkens the ring outright', () => {
+  const config = ringConfig({ dial: { ...DIAL, workspaces: '#000000' } });
+
+  assert.deepEqual(ambientLighting(config, 'workspaces'), {
+    color: 0,
+    brightness: 0,
+    effect: 0,
     speed: 0,
     magic: 0,
   });

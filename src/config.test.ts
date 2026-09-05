@@ -30,6 +30,17 @@ test('invalid values fall back per key without rejecting the file', async (t) =>
     ['[colors]\nidle = "red"', (c) => c.colors.idle, DEFAULT_CONFIG.colors.idle],
     ['[colors]\ndone = "#FFF"', (c) => c.colors.done, DEFAULT_CONFIG.colors.done],
     ['[metrics]\nenabled = "yes"', (c) => c.metricsEnabled, DEFAULT_CONFIG.metricsEnabled],
+    ['[underglow]\ncolor = "nope"', (c) => c.underglow.color, DEFAULT_CONFIG.underglow.color],
+    [
+      '[underglow]\nbrightness = 4',
+      (c) => c.underglow.brightness,
+      DEFAULT_CONFIG.underglow.brightness,
+    ],
+    [
+      '[underglow.dial]\nscroll = "#GG0000"',
+      (c) => c.underglow.dial.scroll,
+      DEFAULT_CONFIG.underglow.dial.scroll,
+    ],
   ];
   for (const [body, pick, expected] of cases) {
     const p = withConfig(body);
@@ -58,4 +69,28 @@ test('control settings are configurable', async (t) => {
   assert.equal(cfg.controls.buttons.ACT12, 'escape');
   assert.equal(cfg.controls.joystick.left, 'none');
   assert.equal(cfg.controls.joystick.right, 'pane');
+});
+
+test('underglow colours are configurable per dial mode', async (t) => {
+  const p = withConfig(
+    ['[underglow]', 'brightness = 0.75', '', '[underglow.dial]', 'workspaces = "#112233"'].join(
+      '\n',
+    ),
+  );
+  t.onTestFinished(() => rmSync(p, { force: true }));
+
+  const cfg = await loadConfig(silentLogger, p);
+
+  assert.equal(cfg.underglow.brightness, 0.75);
+  assert.equal(cfg.underglow.dial.workspaces, '#112233');
+  // An unset mode keeps its default rather than going dark with its neighbour.
+  assert.equal(cfg.underglow.dial.agents, DEFAULT_CONFIG.underglow.dial.agents);
+  assert.equal(cfg.underglow.color, null);
+});
+
+test('a static underglow colour is read as one colour for every mode', async (t) => {
+  const p = withConfig('[underglow]\ncolor = "#FF6600"');
+  t.onTestFinished(() => rmSync(p, { force: true }));
+
+  assert.equal((await loadConfig(silentLogger, p)).underglow.color, '#FF6600');
 });

@@ -70,11 +70,46 @@ The dial cycles `workspaces → agents → scroll`; rotation navigates the activ
 mode and clicking changes mode. Agent navigation is ordered by how much
 attention the agent needs (`blocked` → `done` → `working` → `idle`), so one
 turn from anywhere reaches whatever is blocked. The joystick focuses the
-adjacent pane in the direction moved. The ambient ring is off in workspace
-mode, blue in agent mode, and purple in scroll mode.
+adjacent pane in the direction moved. The ambient ring -- the underglow
+beneath the pad -- carries the mode, so what the dial is about to do is
+readable before it is turned: Shopify green in workspace mode, blue in agent
+mode, purple in scroll mode. All three are configurable, and a static colour
+replaces the indicator entirely.
 
 The daemon renders the six slots as a text row on stdout and logs transitions
 and control failures to stderr, so the row stays parseable on its own.
+
+## The pad layer
+
+`layout/herdr-micro.layers.json` is the layer this project expects the pad to
+be running, exported from Work Louder's Layers editor. Import it there to
+reproduce the bindings; the daemon itself never reads the file.
+
+Every key, the encoder and the joystick bind to OpenAI vendor keycodes
+(`KV_OAI_AG00`--`AG05`, `KV_OAI_ACT06`--`ACT12`, `KV_OAI_ENC_*`, and a
+`"type": "VENDOR"` joystick). A key bound this way emits a `v.oai.hid` vendor
+report on the raw HID interface instead of a keystroke, so the pad drives the
+daemon without typing into whatever window is focused.
+
+Stock keycodes work too, and `src/hardware/protocol.ts` decodes both off the
+same handle. `parseStandardInput` maps HID usages `0x04`--`0x09` onto
+`AG00`--`AG05` and `0x0a`--`0x10` onto `ACT06`--`ACT12` -- `KC_A` through
+`KC_M`, in order -- and reads the dial from the consumer usages for volume up,
+volume down and play/pause. The joystick is a radial notification either way
+(`kb.radial` under stock firmware, `v.oai.rad` here) and is configured by the
+layer's `joystick` block rather than by a keycode. So a layer built entirely
+from stock keycodes drives everything, and stays editable in the Layers web
+editor. What it costs is that the keys also type their letters into the
+focused window, which is what the vendor codes exist to avoid.
+
+The same vendor namespace is why the Layers web editor blurs the layer and
+says to use the ChatGPT app: it will import and flash the file, but it will
+not edit a layer whose keycodes it does not own. Edit the JSON here and
+re-import.
+
+The export carries no `lights` block, so importing it leaves the backlight and
+underglow as they were. The daemon drives the key LEDs and the ambient ring
+over the vendor protocol regardless of what the layer stores.
 
 ## The popup
 
@@ -120,6 +155,14 @@ working = "#1E5AA8"
 done = "#1E8A3C"
 blocked = "#C87A0A"
 
+[underglow]
+brightness = 0.5
+
+[underglow.dial]
+workspaces = "#95BF47"
+agents = "#2C6ECB"
+scroll = "#9C6ADE"
+
 [controls]
 scroll_steps = 1
 dial_mode_order = ["workspaces", "agents", "scroll"]
@@ -145,6 +188,13 @@ enabled = true
 
 - **Colours** are `#rrggbb`. There is no key for `unknown` on purpose -- it
   borrows idle's, as described under [Layout](#layout).
+- **`[underglow.dial]`** is one colour per dial mode. `#000000` is off rather
+  than a shade, so a mode can still be given no ring at all.
+- **`[underglow] brightness`** is `0` to `1` and applies to every mode.
+- **`[underglow] color`** is unset by default. Setting it holds that one colour
+  in every mode and gives up the indicator, leaving nothing to show which mode
+  the dial is in -- so set it only if you would rather the pad glowed one
+  colour than read the dial.
 - **`scroll_steps`** is pages per dial detent, 1–12. Scrolling sends Page
   Up/Page Down to the focused pane as raw terminal input, because herdr's
   `pane.send_keys` vocabulary has no page key -- so what scrolls is whatever

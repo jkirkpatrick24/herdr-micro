@@ -1,16 +1,14 @@
 import type { Config, DialMode } from '../config.js';
 import { SLOT_COUNT, type SlotView } from '../state/store.js';
-import { type AmbientLighting, lightingForStatus, type ThreadLighting } from './protocol.js';
+import {
+  type AmbientLighting,
+  colorToNumber,
+  lightingForStatus,
+  type ThreadLighting,
+} from './protocol.js';
 
-/**
- * The dial's mode, shown on the ambient ring. Workspace mode is the resting
- * mode, so its ring is off rather than a third colour to learn.
- */
-const RINGS: Record<DialMode, AmbientLighting> = {
-  workspaces: { color: 0, brightness: 0, effect: 0, speed: 0, magic: 0 },
-  agents: { color: 0x2277ff, brightness: 0.5, effect: 1, speed: 0, magic: 0 },
-  scroll: { color: 0xaa55ff, brightness: 0.5, effect: 1, speed: 0, magic: 0 },
-};
+/** The ring is unlit rather than black: a colour of 0 is "off", not a shade. */
+const RING_OFF: AmbientLighting = { color: 0, brightness: 0, effect: 0, speed: 0, magic: 0 };
 
 export function renderSlotLighting(view: SlotView[], config: Config): ThreadLighting[] {
   return Array.from({ length: SLOT_COUNT }, (_, id) =>
@@ -18,6 +16,15 @@ export function renderSlotLighting(view: SlotView[], config: Config): ThreadLigh
   );
 }
 
-export function ambientLighting(mode: DialMode = 'workspaces'): AmbientLighting {
-  return RINGS[mode];
+/**
+ * The ambient ring. It indicates the dial's mode, so that turning the dial is
+ * readable before it is turned -- unless a static `color` is configured, which
+ * holds one colour and gives the indicator up.
+ */
+export function ambientLighting(config: Config, mode: DialMode = 'workspaces'): AmbientLighting {
+  const { color, brightness, dial } = config.underglow;
+  const value = colorToNumber(color ?? dial[mode]);
+
+  if (value === 0) return RING_OFF;
+  return { color: value, brightness, effect: 1, speed: 0, magic: 0 };
 }

@@ -41,9 +41,20 @@ export type ControlConfig = {
   joystick: Record<Direction, JoystickAction>;
 };
 
+/**
+ * The underglow. `color` holds one colour and stops the ring indicating the
+ * dial mode; leaving it unset keeps the indicator and uses `dial`.
+ */
+export type UnderglowConfig = {
+  color: string | null;
+  brightness: number;
+  dial: Record<DialMode, string>;
+};
+
 export type Config = {
   colors: ColorConfig;
   controls: ControlConfig;
+  underglow: UnderglowConfig;
   metricsEnabled: boolean;
 };
 
@@ -67,6 +78,14 @@ export const DEFAULT_CONFIG: Config = Object.freeze<Config>({
       ACT12: 'enter',
     },
     joystick: { up: 'pane', down: 'pane', left: 'pane', right: 'pane' },
+  },
+  underglow: {
+    color: null,
+    brightness: 0.5,
+    // Shopify's palette: the logo green, then Polaris blue and purple. Three
+    // Shopify greens would be truer to the brand and unreadable on a diffused
+    // ring at half brightness, which is the whole job of the indicator.
+    dial: { workspaces: '#95BF47', agents: '#2C6ECB', scroll: '#9C6ADE' },
   },
   metricsEnabled: true,
 });
@@ -109,6 +128,7 @@ export async function loadConfig(log: Logger, path = CONFIG_PATH): Promise<Confi
   const config: Config = {
     colors: overlay(colors, DEFAULT_CONFIG.colors, COLOR_KEYS, log, isHex),
     controls: resolveControls(controls, log),
+    underglow: resolveUnderglow(section(parsed, 'underglow'), log),
     metricsEnabled: pick(
       section(parsed, 'metrics'),
       'enabled',
@@ -144,6 +164,15 @@ function resolveControls(obj: Record<string, unknown>, log: Logger): ControlConf
   };
 }
 
+function resolveUnderglow(obj: Record<string, unknown>, log: Logger): UnderglowConfig {
+  const defaults = DEFAULT_CONFIG.underglow;
+  return {
+    color: pick(obj, 'color', defaults.color, log, isHexOrNull),
+    brightness: pick(obj, 'brightness', defaults.brightness, log, isBrightness),
+    dial: overlay(section(obj, 'dial'), defaults.dial, DIAL_MODES, log, isHex),
+  };
+}
+
 // -- Validators. Each answers "is this value usable?", never "is it correct?" --
 
 /** Every mode exactly once: a partial order would make some modes unreachable. */
@@ -161,6 +190,16 @@ const isDialMode = oneOf(DIAL_MODES);
 /** One dial detent sends this many page keys. Capped to keep a nudge sane. */
 function isScrollSteps(v: unknown): v is number {
   return typeof v === 'number' && Number.isInteger(v) && v >= 1 && v <= 12;
+}
+
+/** Unset means "show the dial mode", so absent is a value here rather than a gap. */
+function isHexOrNull(v: unknown): v is string | null {
+  return v === null || isHex(v);
+}
+
+/** The firmware takes a 0-1 fraction; anything outside it is a typo, not a dim. */
+function isBrightness(v: unknown): v is number {
+  return typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= 1;
 }
 
 /** Builds a type guard for a fixed set of allowed strings. */
