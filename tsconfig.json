@@ -1,20 +1,37 @@
 {
+  // Typecheck config: covers every TypeScript file in the repo and emits
+  // nothing. tsconfig.build.json narrows this to the shipped sources and is the
+  // only one that writes output.
   "compilerOptions": {
+    // These differ on purpose. `target` is the syntax level for emit; `lib` is
+    // what the runtime provides. TypeScript never downlevels library methods,
+    // so raising lib above target is exactly how you say "conservative output,
+    // Node 20 standard library" -- findLast and friends compile and emit as-is.
     "target": "ES2022",
+    "lib": ["ES2023"],
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
-    "lib": ["ES2023"],
     "types": ["node"],
+
+    // moduleDetection, isolatedModules, esModuleInterop and resolveJsonModule
+    // are all implied by module: NodeNext -- check with `tsc --showConfig`
+    // before adding any of them back.
+    "verbatimModuleSyntax": true,
+
     "strict": true,
     "noUncheckedIndexedAccess": true,
+    // Four classes extend EventEmitter; this is what stops a method silently
+    // shadowing one of its base's instead of overriding it on purpose.
+    "noImplicitOverride": true,
+    // route() is one long switch where every case returns. A dropped return
+    // would otherwise fall through to the next event's handler.
+    "noFallthroughCasesInSwitch": true,
+    // Off on purpose, not by omission: turning it on is 17 errors, mostly
+    // node-hid's optional fields and our own `field: undefined` writes.
     "exactOptionalPropertyTypes": false,
-    "outDir": "dist",
-    "rootDir": "src",
+
     "sourceMap": true,
-    "declaration": false,
-    "allowImportingTsExtensions": false,
-    "verbatimModuleSyntax": true,
     "skipLibCheck": true
   },
-  "include": ["src/**/*.ts"]
+  "include": ["src/**/*.ts", "vitest.config.ts"]
 }

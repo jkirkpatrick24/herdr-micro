@@ -1,3 +1,6 @@
+import { EventEmitter } from 'node:events';
+
+import type { HerdrClientEventSource, HerdrClientEvents } from '../herdr/client.js';
 import {
   type AgentInfo,
   type AgentStatus,
@@ -5,6 +8,7 @@ import {
   Evt,
   type PaneInfo,
   type SessionSnapshot,
+  type TabInfo,
   type WorkspaceInfo,
 } from '../herdr/rpc.js';
 import type { Logger } from '../log.js';
@@ -21,17 +25,26 @@ export const silentLogger: Logger = {
  * of authoring the tests in TypeScript comes from.
  */
 
-export function workspace(id: string, label = id, n = 1): WorkspaceInfo {
+export function workspace(
+  id: string,
+  label = id,
+  n = 1,
+  opts: { focused?: boolean } = {},
+): WorkspaceInfo {
   return {
     workspace_id: id,
     number: n,
     label,
-    focused: false,
+    focused: opts.focused ?? false,
     pane_count: 1,
     tab_count: 1,
     active_tab_id: `${id}:t1`,
     agent_status: 'idle',
   };
+}
+
+export function tab(id: string, label = id, opts: { focused?: boolean } = {}): TabInfo {
+  return { tab_id: id, label, focused: opts.focused ?? false };
 }
 
 export function pane(
@@ -76,6 +89,7 @@ export function agent(
   workspaceId: string,
   status: AgentStatus,
   kind = 'claude',
+  opts: { stateChangeSeq?: number } = {},
 ): AgentInfo {
   return {
     agent: kind,
@@ -83,6 +97,7 @@ export function agent(
     pane_id: paneId,
     tab_id: `${workspaceId}:t1`,
     workspace_id: workspaceId,
+    ...(opts.stateChangeSeq === undefined ? {} : { state_change_seq: opts.stateChangeSeq }),
   };
 }
 
@@ -96,4 +111,30 @@ export function statusFrame(paneId: string, workspaceId: string, status: AgentSt
     workspace_id: workspaceId,
     agent_status: status,
   });
+}
+
+/**
+ * A stand-in for the event half of a HerdrClient.
+ *
+ * `emit` is typed against HerdrClientEvents, so a test that emits the wrong
+ * payload for an event fails to compile rather than at an assertion three
+ * lines later. That is the whole reason this exists: the previous stub was an
+ * EventEmitter cast through `unknown`, which typed every emit as `any[]`.
+ */
+export function clientBus(): {
+  client: HerdrClientEventSource;
+  emit<K extends keyof HerdrClientEvents>(e: K, ...a: Parameters<HerdrClientEvents[K]>): void;
+} {
+  const bus = new EventEmitter();
+
+  return {
+    client: {
+      on(event, listener) {
+        bus.on(event, listener);
+      },
+    },
+    emit(event, ...args) {
+      bus.emit(event, ...args);
+    },
+  };
 }

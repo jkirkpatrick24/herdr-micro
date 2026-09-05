@@ -1,0 +1,12 @@
+{
+  // The shipped build: sources only, and the only config that emits.
+  // rootDir/outDir live here rather than in the base so the base is free to
+  // typecheck files outside src/ (vitest.config.ts) without tripping rootDir.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist"
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["src/**/*.test.ts", "src/testing/**"]
+}

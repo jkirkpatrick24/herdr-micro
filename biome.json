@@ -6,7 +6,7 @@
     "useIgnoreFile": true
   },
   "files": {
-    "includes": ["src/**/*.ts", "package.json", "biome.json"]
+    "includes": ["src/**/*.ts", "vitest.config.ts", "package.json", "biome.json"]
   },
   "formatter": {
     "enabled": true,

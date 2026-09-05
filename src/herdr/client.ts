@@ -6,7 +6,8 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { promisify } from 'node:util';
-import { Coalescer, type Logger } from '../log.js';
+import { asArray, isArray, isRecord } from '../json.js';
+import { Coalescer, type Logger, reason } from '../log.js';
 
 import {
   type AgentInfo,
@@ -15,29 +16,46 @@ import {
   Evt,
   eventName,
   GLOBAL_SUBSCRIPTIONS,
+  isAgentInfo,
   isAgentStatus,
   isErrorResponse,
   isEventFrame,
+  isResultResponse,
+  isTabInfo,
+  isWorkspaceInfo,
   MEMBERSHIP_EVENTS,
-  type PaneInfo,
   PROTOCOL,
   paneStatusSubscription,
+  parseSnapshot,
   type Request,
+  ResultKey,
+  reqAgentFocus,
   reqAgentList,
+  reqNotificationShow,
+  reqPaneCurrent,
+  reqPaneFocusDirection,
+  reqPaneSendKeys,
+  reqPaneSendText,
+  reqPluginPaneOpen,
+  reqPopupClose,
   reqSnapshot,
   reqSubscribe,
+  reqTabFocus,
+  reqTabList,
+  reqWorkspaceFocus,
   reqWorkspaceList,
   type SessionSnapshot,
   SUBSCRIPTION_STARTED,
   type SubscriptionSpec,
+  type TabInfo,
   type WorkspaceInfo,
 } from './rpc.js';
 
 const execFileAsync = promisify(execFile);
 
-/** The most-repeated expression in the codebase, in one place. */
-export function reason(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
+/** Set equality against a pre-sorted, de-duplicated list. */
+function sameSet(sorted: string[], current: ReadonlySet<string>): boolean {
+  return sorted.length === current.size && sorted.every((id) => current.has(id));
 }
 
 export type ClientOptions = {
@@ -66,14 +84,12 @@ const DEFAULTS = {
 // ---------------------------------------------------------------------------
 
 /**
- * Resolving this wrong produces the worst failure mode there is: a daemon that
- * connects, seeds zero workspaces, and looks perfectly healthy while showing
- * nothing. Always log what was resolved and how many workspaces it seeded.
+ * Finds herdr's socket: explicit env var, then the named session, then the
+ * default path.
  *
- * The named-session layout is ~/.config/herdr/sessions/<name>/herdr.sock --
- * confirmed from herdr's own `server_not_running` error, which names that
- * exact path. The directory only exists once a named session has been created,
- * so its absence proves nothing. `herdr session list` is the fallback.
+ * Resolving this wrong gives the worst failure mode there is -- a daemon that
+ * connects, seeds nothing, and looks perfectly healthy. Hence a log line on
+ * every branch saying what was chosen and why.
  */
 export async function resolveSocketPath(log: Logger): Promise<string> {
   const fromEnv = process.env.HERDR_SOCKET_PATH;
@@ -83,17 +99,23 @@ export async function resolveSocketPath(log: Logger): Promise<string> {
   }
 
   const session = process.env.HERDR_SESSION;
+
   if (session) {
+    // Layout confirmed from herdr's own `server_not_running` error, which
+    // names this path. It exists only once a named session has been created,
+    // so its absence proves nothing -- fall through to asking herdr.
     const direct = join(homedir(), '.config', 'herdr', 'sessions', session, 'herdr.sock');
     if (existsSync(direct)) {
       log.info('socket resolved', { path: direct, via: `HERDR_SESSION=${session}` });
       return direct;
     }
+
     const listed = await socketFromSessionList(session);
     if (listed) {
       log.info('socket resolved', { path: listed, via: `herdr session list (${session})` });
       return listed;
     }
+
     log.warn('named session has no socket yet', { session, tried: direct });
   }
 
@@ -128,6 +150,13 @@ async function socketFromSessionList(session: string): Promise<string | null> {
 // ---------------------------------------------------------------------------
 
 /**
+ * Cap on a single unterminated frame. A session snapshot is the largest thing
+ * herdr sends and runs to tens of KB, so this is far above any legitimate line
+ * while still bounding what a peer that never sends a newline can cost us.
+ */
+const MAX_LINE_CHARS = 1_000_000;
+
+/**
  * Only JSON.parse is guarded. Wrapping the onMessage call too would swallow
  * every downstream bug -- a throw in the store or renderer would be logged as
  * "unparseable frame from herdr" and the daemon would carry on with a stale
@@ -135,6 +164,9 @@ async function socketFromSessionList(session: string): Promise<string | null> {
  */
 function readLines(socket: net.Socket, onMessage: (msg: unknown) => void, log: Logger): void {
   let buf = '';
+  // Set while the tail of an oversized line is still arriving, so it is
+  // discarded rather than parsed as though it were a frame of its own.
+  let resyncing = false;
   socket.setEncoding('utf8');
   socket.on('data', (chunk: string) => {
     buf += chunk;
@@ -142,6 +174,10 @@ function readLines(socket: net.Socket, onMessage: (msg: unknown) => void, log: L
     while ((idx = buf.indexOf('\n')) >= 0) {
       const line = buf.slice(0, idx);
       buf = buf.slice(idx + 1);
+      if (resyncing) {
+        resyncing = false;
+        continue;
+      }
       if (!line.trim()) continue;
       let parsed: unknown;
       try {
@@ -151,6 +187,16 @@ function readLines(socket: net.Socket, onMessage: (msg: unknown) => void, log: L
         continue;
       }
       onMessage(parsed);
+    }
+    // Dropping the buffer bounds the memory; resyncing at the next newline is
+    // what keeps the stream usable afterwards, rather than parsing the tail of
+    // the discarded frame and logging a second, misleading parse failure.
+    if (buf.length > MAX_LINE_CHARS) {
+      log.warn('oversized frame from herdr; resyncing at the next newline', {
+        chars: buf.length,
+      });
+      buf = '';
+      resyncing = true;
     }
   });
 }
@@ -175,33 +221,43 @@ export function requestOnce(
     let settled = false;
     let timer: NodeJS.Timeout;
 
-    const finish = (err: Error | null, value?: Record<string, unknown>) => {
-      if (settled) return;
+    // Every outcome funnels through here, so the socket and timer are cleaned
+    // up once no matter which of them fires first. Split in two rather than
+    // taking an `(err, value?)` pair: that shape cannot express "exactly one of
+    // these is present", so the success path needed a non-null assertion to
+    // stand in for an invariant only the callers were keeping.
+    const done = (): boolean => {
+      if (settled) return false;
       settled = true;
+
       clearTimeout(timer);
       socket.destroy();
-      if (err) reject(err);
-      else resolve(value!);
+      return true;
     };
 
-    timer = setTimeout(
-      () => finish(new Error(`herdr request timed out: ${req.method}`)),
-      timeoutMs,
-    );
+    const fail = (err: Error) => {
+      if (done()) reject(err);
+    };
+
+    const succeed = (value: Record<string, unknown>) => {
+      if (done()) resolve(value);
+    };
+
+    timer = setTimeout(() => fail(new Error(`herdr request timed out: ${req.method}`)), timeoutMs);
 
     socket.on('connect', () => socket.write(`${JSON.stringify(req)}\n`));
-    socket.on('error', (err) => finish(err));
-    socket.on('close', () => finish(new Error(`herdr closed before responding: ${req.method}`)));
+    socket.on('error', (err) => fail(err));
+    socket.on('close', () => fail(new Error(`herdr closed before responding: ${req.method}`)));
 
     readLines(
       socket,
       (msg) => {
         if (isErrorResponse(msg)) {
-          finish(new Error(`herdr error on ${req.method}: ${msg.error?.message ?? 'unknown'}`));
+          fail(new Error(`herdr error on ${req.method}: ${msg.error?.message ?? 'unknown'}`));
           return;
         }
-        const result = (msg as { result?: Record<string, unknown> }).result;
-        if (result) finish(null, result);
+
+        if (isResultResponse(msg)) succeed(msg.result);
       },
       log,
     );
@@ -213,21 +269,18 @@ export function requestOnce(
 // ---------------------------------------------------------------------------
 
 /**
- * A subscription is a connection. herdr accepts one request per socket, so
- * subscriptions cannot be added to a live stream -- a new set means a new
- * Subscriber.
+ * One subscription set on one socket, because herdr accepts a single request
+ * per connection -- so subscriptions can never be added to a live stream.
  *
  * Two subtleties, both learned the hard way:
  *
- *  - The event handler is passed to start() rather than attached afterwards.
- *    resolve() runs inside the data callback, so the caller's `await` resumes
- *    on a microtask *after* readLines has finished draining the current chunk.
- *    Any frame herdr batched into the same TCP segment as the ack would be
- *    emitted to nobody and lost.
+ *  - The event handler is passed INTO start() rather than attached after it.
+ *    Any frame herdr batched into the same chunk as the ack would otherwise be
+ *    emitted before the caller's `await` resumed, and lost.
  *
- *  - Loss is latched. EventEmitter.emit with no listener is a silent no-op, so
- *    a drop occurring before the consumer attaches its handler would otherwise
- *    strand the reconnect loop forever.
+ *  - Loss is latched, because emitting to no listener is a silent no-op. A drop
+ *    that happens before the consumer attaches would otherwise strand the
+ *    reconnect loop forever.
  */
 export class Subscriber extends EventEmitter {
   private socket: net.Socket | null = null;
@@ -260,6 +313,10 @@ export class Subscriber extends EventEmitter {
     this.emit('lost', err);
   }
 
+  /**
+   * Resolves once herdr acknowledges the subscription. Before the ack, every
+   * problem rejects; after it, every problem is a loss.
+   */
   start(onEvent?: (frame: EventFrame) => void): Promise<void> {
     return new Promise((resolve, reject) => {
       const socket = net.createConnection(this.socketPath);
@@ -287,15 +344,15 @@ export class Subscriber extends EventEmitter {
       });
 
       socket.on('close', () => {
-        // A close BEFORE the ack must reject, or start() never settles: the
-        // ack timer is gone and no other path resolves the promise. An awaited
-        // watchPane would then hang forever, connectOnce would never return,
-        // and the reconnect loop would never even attach its handler -- a
-        // permanently parked daemon holding stale colours, with nothing logged.
+        // A close before the ack must reject, or start() never settles at all:
+        // the ack timer is already cleared and no other path resolves. That
+        // would park connectOnce forever, holding stale colours and logging
+        // nothing.
         if (!this.acked) {
           fail(new Error(`herdr closed before subscribe ack (${this.label})`));
           return;
         }
+
         clearTimeout(ackTimer);
         this.markLost(new Error('stream closed'));
       });
@@ -307,13 +364,14 @@ export class Subscriber extends EventEmitter {
             if (!this.acked) fail(new Error(msg.error?.message ?? 'subscribe rejected'));
             return;
           }
-          const result = (msg as { result?: { type?: string } }).result;
-          if (result?.type === SUBSCRIPTION_STARTED) {
+
+          if (isResultResponse(msg) && msg.result.type === SUBSCRIPTION_STARTED) {
             this.acked = true;
             clearTimeout(ackTimer);
             resolve();
             return;
           }
+
           if (isEventFrame(msg)) onEvent?.(msg);
         },
         this.log,
@@ -332,7 +390,7 @@ export class Subscriber extends EventEmitter {
 // Client
 // ---------------------------------------------------------------------------
 
-export type PaneStatus = { paneId: string; workspaceId: string; status: AgentStatus };
+export type PaneStatus = { paneId: string; status: AgentStatus };
 
 export type HerdrClientEvents = {
   seed: (snapshot: SessionSnapshot) => void;
@@ -353,17 +411,35 @@ export declare interface HerdrClient {
 }
 
 /**
- * Owns one topology subscription plus one status subscription per agent pane.
+ * The subscribe half of the client, which is all a consumer of its events
+ * needs. Asking for the whole HerdrClient forced anything standing in for one
+ * to be cast through `unknown`, which then silently covered every method the
+ * stand-in did not have.
+ */
+export type HerdrClientEventSource = {
+  on<K extends keyof HerdrClientEvents>(e: K, l: HerdrClientEvents[K]): unknown;
+};
+
+/**
+ * Owns exactly two connections: one for topology, one for agent status.
  *
- * The fan-out is not an optimisation, it is the only design that works:
- * `pane.agent_status_changed` is the sole reliable status signal, it requires a
- * pane_id, and herdr accepts one request per connection -- so N agent panes
- * means N+1 sockets. Any socket dropping tears the whole set down and
- * reconnects, so colours are never carried across a gap.
+ * Status comes only from `pane.agent_status_changed`, which needs a pane_id --
+ * but one subscribe can carry an entry per pane, so all of them share a single
+ * socket (measured; re-runnable with tools/herdr-probe.mjs). Panes cannot be
+ * ADDED to a live subscription, so that socket is rebuilt whenever the agent
+ * set changes, and the agent.list refresh behind every trigger covers the gap.
+ *
+ * Topology has its own connection so an agent appearing never tears it down,
+ * and so it can be subscribed before the snapshot is requested.
+ *
+ * Either socket dropping rebuilds both, so colours never survive a gap.
  */
 export class HerdrClient extends EventEmitter {
   private globalSub: Subscriber | null = null;
-  private paneSubs = new Map<string, Subscriber | 'pending'>();
+  /** One connection carrying every agent pane's status subscription. */
+  private statusSub: Subscriber | null = null;
+  /** The pane set statusSub covers, so it is only rebuilt when that changes. */
+  private watchedPanes = new Set<string>();
   private stopped = false;
   private loopRunning = false;
   private backoff: number;
@@ -395,7 +471,21 @@ export class HerdrClient extends EventEmitter {
     this.backoff = this.opts.backoffMinMs;
   }
 
+  /**
+   * Single-use: a stopped client cannot be started again. Restarting would
+   * have to rendezvous with a connectLoop that is still draining, and reviving
+   * it would resume on a stale generation. Nothing needs it -- both entry
+   * points stop only at shutdown -- so this refuses loudly rather than
+   * returning normally and never connecting.
+   *
+   * `stopped` is checked before `loopRunning` so a restart landing in the
+   * draining window reports the real reason, not "already started".
+   */
   async start(): Promise<void> {
+    if (this.stopped) {
+      this.log.warn('herdr client was stopped and cannot be restarted; ignoring start()');
+      return;
+    }
     if (this.loopRunning) {
       this.log.warn('herdr client already started; ignoring duplicate start()');
       return;
@@ -422,27 +512,107 @@ export class HerdrClient extends EventEmitter {
     return this.socketPath;
   }
 
+  focusAgent(paneId: string): Promise<void> {
+    return this.call(reqAgentFocus(`pad:focus:${paneId}`, paneId));
+  }
+
+  focusWorkspace(workspaceId: string): Promise<void> {
+    return this.call(reqWorkspaceFocus('pad:workspace-focus', workspaceId));
+  }
+
+  focusTab(tabId: string): Promise<void> {
+    return this.call(reqTabFocus('pad:tab-focus', tabId));
+  }
+
+  focusPaneDirection(direction: 'up' | 'down' | 'left' | 'right'): Promise<void> {
+    return this.call(reqPaneFocusDirection('pad:pane-focus', direction));
+  }
+
+  agentList(): Promise<AgentInfo[]> {
+    return this.list(reqAgentList('pad:agents'), ResultKey.agents, isAgentInfo);
+  }
+
+  workspaceList(): Promise<WorkspaceInfo[]> {
+    return this.list(reqWorkspaceList('pad:workspaces'), ResultKey.workspaces, isWorkspaceInfo);
+  }
+
+  tabList(workspaceId: string): Promise<TabInfo[]> {
+    return this.list(reqTabList('pad:tabs', workspaceId), ResultKey.tabs, isTabInfo);
+  }
+
+  async currentPaneId(): Promise<string | null> {
+    const current = await this.request(reqPaneCurrent('pad:current'));
+    const pane = current.pane;
+    return isRecord(pane) && typeof pane.pane_id === 'string' ? pane.pane_id : null;
+  }
+
+  async sendKeysToFocusedPane(keys: string[]): Promise<void> {
+    const paneId = await this.currentPaneId();
+    if (paneId) await this.call(reqPaneSendKeys('pad:send-keys', paneId, keys));
+  }
+
+  /**
+   * Raw input for what the key vocabulary cannot say. Separate from
+   * sendKeysToFocusedPane rather than folded into it, because losing herdr's
+   * server-side key validation is a real cost and should be visible at the
+   * call site: this method's bytes are checked by nothing.
+   */
+  async sendTextToFocusedPane(text: string): Promise<void> {
+    const paneId = await this.currentPaneId();
+    if (paneId) await this.call(reqPaneSendText('pad:send-text', paneId, text));
+  }
+
+  /**
+   * There is no toggle method, so this probes: close whatever popup is open,
+   * and if there was none, open ours. The notification is the last resort for
+   * a standalone install with no plugin pane registered.
+   */
+  async toggleAgentPopup(): Promise<void> {
+    try {
+      await this.call(reqPopupClose('pad:popup-close'));
+      return;
+    } catch {
+      // No popup is open; try the House of Herdr plugin entrypoint.
+    }
+    try {
+      await this.call(reqPluginPaneOpen('pad:popup-open'));
+    } catch {
+      await this.call(reqNotificationShow('pad:popup-fallback', 'Creator Micro controls'));
+    }
+  }
+
+  /** Back to the pre-connect state, so the next attempt starts clean. */
   private teardown(): void {
     if (this.refreshTimer) {
       clearInterval(this.refreshTimer);
       this.refreshTimer = null;
     }
+
     this.globalSub?.stop();
     this.globalSub = null;
-    for (const sub of this.paneSubs.values()) if (sub !== 'pending') sub.stop();
-    this.paneSubs.clear();
+
+    this.statusSub?.stop();
+    this.statusSub = null;
+    this.watchedPanes = new Set();
+
     this.seeded = false;
     this.pending = [];
     this.lossLatch = null;
   }
 
+  /** Connect, wait for the connection to die, back off, repeat until stopped. */
   private async connectLoop(): Promise<void> {
     while (!this.stopped) {
+      // Each attempt gets a generation, so work from an abandoned one can tell
+      // that it is stale and bow out. See stale().
       const gen = ++this.generation;
       let connectedAt = 0;
+
       try {
         await this.connectOnce(gen);
         connectedAt = Date.now();
+
+        // Park here until something wakes us: a lost stream, or stop().
         await new Promise<void>((resolve) => {
           const finish = (err: Error | null) => {
             if (err && gen === this.generation) {
@@ -451,15 +621,16 @@ export class HerdrClient extends EventEmitter {
             }
             resolve();
           };
+
           this.wake = finish;
-          // Both loss paths are latched, so a drop during connectOnce -- the
-          // global socket, or any of the concurrently-opened pane
-          // subscriptions -- is picked up here instead of parking the loop on
-          // an already-dead connection.
-          this.globalSub?.onLost(finish);
+
+          // A drop during connectOnce happened before `wake` existed, but
+          // signalLoss latches it, so it is picked up here rather than parking
+          // the loop on an already-dead connection.
           if (this.lossLatch) finish(this.lossLatch);
           else if (this.stopped) finish(null);
         });
+
         this.wake = null;
       } catch (err) {
         const why = reason(err);
@@ -471,8 +642,8 @@ export class HerdrClient extends EventEmitter {
       if (this.stopped) break;
 
       // Reset the backoff only if the connection actually held. Resetting on a
-      // successful subscribe alone lets a daemon that accepts subscriptions and
-      // then drops them immediately drive a permanent reconnect storm.
+      // successful subscribe alone lets a herdr that accepts subscriptions and
+      // immediately drops them drive a permanent reconnect storm.
       if (connectedAt && Date.now() - connectedAt >= this.opts.healthyAfterMs) {
         this.backoff = this.opts.backoffMinMs;
       }
@@ -480,6 +651,7 @@ export class HerdrClient extends EventEmitter {
       await sleep(this.backoff);
       this.backoff = Math.min(this.backoff * 2, this.opts.backoffMaxMs);
     }
+
     this.loopRunning = false;
   }
 
@@ -495,6 +667,7 @@ export class HerdrClient extends EventEmitter {
     this.seeded = false;
     this.pending = [];
 
+    // 1. Topology stream first, so nothing that happens from here is missed.
     const sub = new Subscriber(
       this.socketPath,
       GLOBAL_SUBSCRIPTIONS,
@@ -502,22 +675,28 @@ export class HerdrClient extends EventEmitter {
       'global',
       this.opts.ackTimeoutMs,
     );
+
     await sub.start((frame) => this.onGlobalFrame(frame, gen));
+
     if (this.stale(gen)) {
       sub.stop();
       throw new Error('client stopped during connect');
     }
-    this.globalSub = sub;
 
+    this.globalSub = sub;
+    sub.onLost((err) => {
+      if (gen === this.generation) this.signalLoss(err);
+    });
+
+    // 2. Snapshot. Frames arriving during this request are buffered, not lost.
     const result = await this.request(reqSnapshot('seed'));
     if (this.stale(gen)) throw new Error('client stopped during connect');
 
-    const snapshot = result.snapshot as SessionSnapshot | undefined;
-    if (!snapshot) throw new Error('snapshot response had no snapshot payload');
+    const snapshot = parseSnapshot(result[ResultKey.snapshot]);
+    if (!snapshot) throw new Error('snapshot response had no usable snapshot payload');
 
-    // rpc.ts was verified against one protocol version. A bump does not
-    // necessarily break anything, but it should never be discovered by
-    // debugging a wrong colour weeks later.
+    // A protocol bump does not necessarily break anything, but it should never
+    // be discovered by debugging a wrong colour weeks later.
     if (snapshot.protocol !== PROTOCOL) {
       this.log.warn('herdr protocol differs from the one rpc.ts was verified against', {
         herdr: snapshot.protocol,
@@ -536,28 +715,31 @@ export class HerdrClient extends EventEmitter {
       agentPanes: agentPanes.length,
     });
 
+    // 3. Seed, then replay whatever arrived while the snapshot was in flight.
     this.emit('seed', snapshot);
     this.seeded = true;
+
     const replay = this.pending;
     this.pending = [];
     for (const frame of replay) this.emit('event', frame);
 
-    // Concurrently: each subscribe is a round trip, and on a sick daemon each
-    // costs the full ack timeout. Sequentially that is N x ackTimeoutMs of dead
-    // air before the pad shows anything. watchPane handles its own failures.
-    await Promise.all(agentPanes.map((paneId) => this.watchPane(paneId, gen)));
+    // 4. Status stream. Opened here rather than left to refreshAgents, which
+    // runs behind a Coalescer: if a lifecycle event already triggered one,
+    // that call returns immediately and we would finish with no status source.
+    await this.syncStatusSubscription(agentPanes, gen);
     if (this.stale(gen)) throw new Error('client stopped during connect');
 
-    // The snapshot's statuses were read before these subscriptions existed, and
-    // pane.agent_status_changed only reports future changes -- so anything that
-    // moved in between would be invisible until the next real transition. One
-    // agent.list covers every pane.
+    // 5. Backfill. The snapshot's statuses predate the subscription just
+    // opened, and status events only report future changes, so anything that
+    // moved in between would stay invisible until the next real transition.
     await this.refreshAgents(gen);
 
+    // ...and again on a timer, which is what makes the daemon self-healing.
     this.refreshTimer = setInterval(() => {
       if (this.stale(gen)) return;
       void this.refreshAgents(gen);
     }, this.opts.refreshIntervalMs);
+
     this.refreshTimer.unref?.();
   }
 
@@ -565,112 +747,147 @@ export class HerdrClient extends EventEmitter {
     return requestOnce(this.socketPath, req, this.log, this.opts.requestTimeoutMs);
   }
 
+  /** A request whose result carries nothing worth reading. */
+  private async call(req: Request): Promise<void> {
+    await this.request(req);
+  }
+
+  /**
+   * A request whose result is one named array, absent meaning empty.
+   *
+   * The element guard is required rather than optional. Without it this was
+   * `result[key] as T[]` -- an assertion about a payload nobody had looked at,
+   * made in a generic that could not have checked it even in principle, and
+   * inferred from the call site's return type. Anything herdr put in that array
+   * became a `T` on the strength of the caller's expectations.
+   */
+  private async list<T>(req: Request, key: string, valid: (v: unknown) => v is T): Promise<T[]> {
+    const result = await this.request(req);
+    return asArray(result[key]).filter(valid);
+  }
+
   private stale(gen: number): boolean {
     return this.stopped || gen !== this.generation;
   }
 
+  /** Buffers until the seed has been emitted, then forwards. */
   private onGlobalFrame(frame: EventFrame, gen: number): void {
     if (gen !== this.generation) return;
+
     if (!this.seeded) this.pending.push(frame);
     else this.emit('event', frame);
+
     void this.trackPaneLifecycle(frame, gen);
   }
 
-  /** Open a status subscription for one agent pane. Idempotent under concurrency. */
-  private async watchPane(paneId: string, gen: number): Promise<void> {
-    if (gen !== this.generation || this.paneSubs.has(paneId)) return;
-    // Reserve the slot before awaiting: two lifecycle events for the same pane
-    // (pane_created then pane_agent_detected) otherwise both pass the guard and
-    // open a second, permanently orphaned socket that double-emits status.
-    this.paneSubs.set(paneId, 'pending');
+  /**
+   * Point the status connection at exactly `paneIds`, rebuilding it if that set
+   * has changed.
+   *
+   * A subscription cannot be extended in place -- a second request on a live
+   * socket closes it -- so growth means a new connection. The window while it
+   * reconnects is covered by the agent.list that triggered this call and by the
+   * periodic refresh, both of which carry authoritative statuses.
+   */
+  private async syncStatusSubscription(paneIds: string[], gen: number): Promise<void> {
+    // Sorted so the comparison against the watched set is order-independent.
+    const desired = [...new Set(paneIds)].sort();
+    if (this.statusSub && sameSet(desired, this.watchedPanes)) return;
+
+    // A deliberate rebuild is not a loss and must not trigger a reconnect.
+    this.statusSub?.removeAllListeners('lost');
+    this.statusSub?.stop();
+    this.statusSub = null;
+    this.watchedPanes = new Set();
+
+    if (desired.length === 0 || this.stale(gen)) return;
 
     const sub = new Subscriber(
       this.socketPath,
-      paneStatusSubscription(paneId),
+      desired.map(paneStatusSubscription),
       this.log,
-      paneId,
+      `status x${desired.length}`,
       this.opts.ackTimeoutMs,
     );
 
     try {
       await sub.start((frame) => {
         if (gen !== this.generation) return;
+
+        // Validate rather than cast: an unrecognised status would reach the
+        // glyph and colour tables, which only know the five real ones. The
+        // pane id must be present too, since one socket carries many panes.
         const d = frame.data ?? {};
-        // Validate rather than cast: an unrecognised status would otherwise
-        // reach the glyph and colour tables, which are keyed on the five known
-        // values.
+        const paneId = d.pane_id;
         const status = d.agent_status;
-        if (!isAgentStatus(status)) return;
-        this.emit('paneStatus', {
-          paneId: (d.pane_id as string) ?? paneId,
-          workspaceId: (d.workspace_id as string) ?? '',
-          status,
-        });
+        if (typeof paneId !== 'string' || !isAgentStatus(status)) return;
+
+        this.emit('paneStatus', { paneId, status });
       });
     } catch (err) {
-      this.paneSubs.delete(paneId);
       sub.stop();
-      // A pane with no status source shows its seed colour forever while every
-      // other key keeps updating -- a stale colour that looks healthy. Treat it
-      // as a connection failure so the whole set is rebuilt.
-      this.log.warn('pane status subscription failed; reconnecting', {
-        paneId,
+
+      // With no status source every key holds its seed colour forever while
+      // the rest keep updating -- a stale pad that looks healthy. Treat it as
+      // a connection failure so the whole set is rebuilt.
+      this.log.warn('status subscription failed; reconnecting', {
+        panes: desired.length,
         reason: reason(err),
       });
+
       if (gen === this.generation) {
         this.signalLoss(err instanceof Error ? err : new Error(String(err)));
       }
       return;
     }
 
-    // The pane may have closed while the ack was in flight, in which case
-    // unwatchPane already ran and found only the marker.
-    if (this.stale(gen) || this.paneSubs.get(paneId) !== 'pending') {
-      this.paneSubs.delete(paneId);
+    if (this.stale(gen)) {
       sub.stop();
       return;
     }
-    this.paneSubs.set(paneId, sub);
+
+    this.statusSub = sub;
+    this.watchedPanes = new Set(desired);
+
     sub.onLost((err) => {
-      if (gen !== this.generation) return;
-      this.signalLoss(err);
+      if (gen === this.generation) this.signalLoss(err);
     });
   }
 
-  private unwatchPane(paneId: string): void {
-    const sub = this.paneSubs.get(paneId);
-    if (!sub) return;
-    this.paneSubs.delete(paneId);
-    if (sub === 'pending') return; // watchPane sees the missing marker and cleans up
-    sub.removeAllListeners('lost'); // an intentional close must not trigger reconnect
-    sub.stop();
-  }
-
   /**
-   * Keeps the per-pane subscription set in step with reality. Only panes that
-   * actually hold an agent are watched -- pane.created also fires for plain
-   * shell panes, and subscribing to those would grow one socket per pane the
-   * user ever opens.
+   * Turns pane lifecycle events into agent.list refreshes, which own the
+   * status subscription set.
+   *
+   * The events are triggers, never the source: agent.list is what decides which
+   * panes hold an agent. That closes two gaps lifecycle events leave open -- an
+   * agent can stop being one without its pane closing, and a
+   * pane_agent_detected can be missed entirely. Each branch here only decides
+   * whether a refresh is worth a round trip.
    */
   private async trackPaneLifecycle(frame: EventFrame, gen: number): Promise<void> {
     const d = frame.data ?? {};
     const type = eventName(frame);
 
+    // A pane appeared, or became an agent.
     if (type === Evt.paneAgentDetected || type === Evt.paneCreated) {
-      const pane = d.pane as PaneInfo | undefined;
-      const paneId = (d.pane_id as string) ?? pane?.pane_id;
-      if (!paneId) return;
-      // pane_created carries the record, so a shell pane can be filtered out.
-      // pane_agent_detected carries only ids and always implies an agent.
-      if (type === Evt.paneCreated && pane && !pane.agent) return;
-      await this.watchPane(paneId, gen);
+      // pane_created carries the record, so a plain shell pane can be filtered
+      // out before it costs a round trip. pane_agent_detected carries only ids
+      // and always implies an agent.
+      const pane = d.pane;
+      if (type === Evt.paneCreated && isRecord(pane) && !pane.agent) return;
+
       await this.refreshAgents(gen);
       return;
     }
 
+    // A pane went away.
     if (type === Evt.paneClosed || type === Evt.paneExited) {
-      const paneId = d.pane_id as string | undefined;
-      if (paneId) this.unwatchPane(paneId);
+      // Only a pane we actually watch is worth a round trip; shell panes open
+      // and close constantly and never held a status subscription.
+      const paneId = d.pane_id;
+      if (typeof paneId === 'string' && this.watchedPanes.has(paneId)) {
+        await this.refreshAgents(gen);
+      }
       return;
     }
 
@@ -678,26 +895,29 @@ export class HerdrClient extends EventEmitter {
   }
 
   /**
-   * Membership and order come from workspace.list, never from the events
-   * themselves.
+   * Membership and order come from workspace.list, never from the events --
+   * they are only triggers to re-read it.
    *
-   * On subscribe herdr replays a backlog of historical workspace events, and
-   * replays them OUT OF ORDER -- a workspace_closed can arrive before the
-   * matching workspace_created. Applying those directly resurrects a workspace
-   * that was deleted long ago, and it then holds a key forever. Verified
-   * against herdr 0.8.2: a workspace closed an hour earlier reappeared because
-   * its create was replayed after its close.
+   * This was originally written to defend against herdr replaying a backlog of
+   * historical workspace events out of order on subscribe, which could
+   * resurrect a long-deleted workspace. That is UNREPRODUCED on herdr 0.8.2
+   * (tools/herdr-probe.mjs): subscribing to all six lifecycle events in a
+   * three-workspace session replayed nothing at all. One session's silence is
+   * not a disproof, so the shape stays.
    *
-   * Treating the events purely as triggers and re-reading the real list costs
-   * one round trip per membership change, which is rare.
+   * It is the right shape regardless: workspace.list is authoritative and
+   * events are not, and membership changes are rare enough that a round trip
+   * each costs nothing.
    */
   private reconcileWorkspaces(gen: number): Promise<void> {
     return this.reconcileGate.run(async () => {
       try {
         const result = await this.request(reqWorkspaceList('workspaces'));
         if (this.stale(gen)) return;
-        const list = result.workspaces as WorkspaceInfo[] | undefined;
-        if (list) this.emit('workspaces', list);
+        // An absent list means "herdr said nothing", which must not be read as
+        // "there are no workspaces" -- that would blank every label.
+        const list = result[ResultKey.workspaces];
+        if (isArray(list)) this.emit('workspaces', list.filter(isWorkspaceInfo));
       } catch (err) {
         this.log.warn('could not reconcile workspaces', { reason: reason(err) });
       }
@@ -705,50 +925,30 @@ export class HerdrClient extends EventEmitter {
   }
 
   /**
-   * The authoritative agent refresh: one `agent.list` covering every agent
-   * pane.
+   * The authoritative agent refresh: one `agent.list` covering every pane.
    *
    * Runs at connect, on lifecycle events, and on a timer. The timer is what
-   * makes the daemon self-healing -- a missed event, a status subscription that
-   * went quiet, or an agent that disappeared without the lifecycle event we
-   * expected all resolve on the next pass instead of persisting until a
-   * reconnect. Coalesced, so a burst of triggers costs one extra listing rather
-   * than one per trigger.
+   * makes the daemon self-healing -- a missed event, a status stream gone
+   * quiet, or an agent that vanished without the event we expected all resolve
+   * on the next pass rather than persisting until a reconnect. Coalesced, so a
+   * burst of triggers costs one extra listing, not one each.
    */
   private refreshAgents(gen: number): Promise<void> {
     return this.backfillGate.run(async () => {
       try {
         const result = await this.request(reqAgentList('agents'));
         if (this.stale(gen)) return;
-        const agents = ((result.agents as AgentInfo[] | undefined) ?? []).filter(
-          (a) => a?.pane_id && isAgentStatus(a.agent_status),
-        );
+        // isAgentInfo subsumes the pane_id and agent_status checks this used to
+        // make by hand, right after asserting the array's element type.
+        const agents = asArray(result[ResultKey.agents]).filter(isAgentInfo);
         this.emit('agents', agents);
-        await this.reconcileSubscriptions(agents, gen);
+        await this.syncStatusSubscription(
+          agents.map((a) => a.pane_id),
+          gen,
+        );
       } catch (err) {
         this.log.warn('could not refresh agents', { reason: reason(err) });
       }
     });
-  }
-
-  /**
-   * Bring the per-pane subscription set in line with the authoritative list.
-   *
-   * Lifecycle events alone are not enough: an agent can stop being an agent
-   * without the pane closing, and a pane_agent_detected can be missed. Deriving
-   * the desired set from agent.list closes both, rather than trusting that
-   * every departure announces itself.
-   */
-  private async reconcileSubscriptions(agents: AgentInfo[], gen: number): Promise<void> {
-    const desired = new Set(agents.map((a) => a.pane_id));
-
-    for (const [paneId, sub] of this.paneSubs) {
-      // Leave in-flight opens alone; they settle themselves.
-      if (sub !== 'pending' && !desired.has(paneId)) this.unwatchPane(paneId);
-    }
-
-    const missing = [...desired].filter((id) => !this.paneSubs.has(id));
-    if (missing.length === 0) return;
-    await Promise.all(missing.map((id) => this.watchPane(id, gen)));
   }
 }

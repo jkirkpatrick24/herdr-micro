@@ -1,5 +1,7 @@
 # Validation
 
+`CLAUDE.md` is a symlink to this file. Edit this one.
+
 Run validations from the repository root after making changes.
 
 ## Required checks
@@ -12,9 +14,10 @@ npm run typecheck
 npm test
 ```
 
-- `npm run check` runs Biome formatting, import organization, and recommended lint rules across `src/**/*.ts`, `package.json`, and `biome.json`.
-- `npm run typecheck` runs TypeScript with `--noEmit`.
-- `npm test` compiles TypeScript and runs the compiled tests with Node's test runner. All tests must pass.
+- `npm run check` runs Biome formatting, import organization, and recommended lint rules across `src/**/*.ts`, `vitest.config.ts`, `package.json`, and `biome.json`.
+- `npm run typecheck` runs TypeScript with `--noEmit` across every file, tests included.
+- `npm test` runs the Vitest suite (`vitest run`) directly against the TypeScript sources. All tests must pass.
+- `npm run test:coverage` runs the same suite with V8 coverage; the text summary goes to stdout and `lcov`/HTML reports land in `coverage/`. Thresholds are enforced (85% statements/functions/lines, 80% branches), so this fails on a coverage drop even when every test passes.
 
 ## Formatting
 
@@ -34,7 +37,7 @@ Do not use `--write` as a validation substitute; formatting changes should be re
 
 ## Build validation
 
-Run the production compilation when changing compiler settings, module boundaries, build output, or packaging:
+Run the production compilation when changing compiler settings, module boundaries, build output, or packaging. It uses `tsconfig.build.json`, which excludes tests and `src/testing/`:
 
 ```sh
 npm run build

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { test } from 'node:test';
+import { test } from 'vitest';
 import { renderRow, route } from './route.js';
 import { Store } from './state/store.js';
 import { silentLogger, simpleSession, workspace } from './testing/fixtures.js';

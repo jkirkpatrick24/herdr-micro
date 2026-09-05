@@ -1,0 +1,25 @@
+id = "jkirkpatrick24.herdr-micro"
+name = "Herdr Micro"
+version = "0.1.0"
+min_herdr_version = "0.8.0"
+description = "Agent status lights and controls on the Work Louder Creator Micro 2"
+platforms = ["macos"]
+
+[[build]]
+command = ["npm", "install"]
+
+[[build]]
+command = ["npm", "run", "build"]
+
+[[startup]]
+command = ["node", "dist/main.js"]
+
+[[panes]]
+id = "keys"
+title = "Creator Micro keys"
+placement = "popup"
+# Sized to the panel: 59 columns of content plus a 2-column margin each side
+# and the border; 13 rows of content plus the border.
+width = 66
+height = 16
+command = ["node", "dist/popup.js"]

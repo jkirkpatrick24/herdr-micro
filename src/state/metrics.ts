@@ -2,7 +2,7 @@ import { appendFile, mkdir } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 
-import type { Logger } from '../log.js';
+import { type Logger, reason } from '../log.js';
 import type { Transition } from './store.js';
 
 export const DEFAULT_METRICS_PATH = join(
@@ -53,7 +53,7 @@ export class Metrics {
       this.failed = true;
       this.log.warn('metrics disabled after write failure', {
         path: this.path,
-        reason: err instanceof Error ? err.message : String(err),
+        reason: reason(err),
       });
     }
   }

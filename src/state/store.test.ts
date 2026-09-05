@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
-import { test } from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
+import { test } from 'vitest';
+import type { Logger } from '../log.js';
 import { agent, pane, silentLogger, snapshot, workspace } from '../testing/fixtures.js';
 import { type SlotView, Store, type Transition } from './store.js';
 
@@ -94,6 +95,30 @@ test('only the first six agents are displayed', () => {
   store.applyAgents(Array.from({ length: 8 }, (_, i) => agent(`w1:p${i}`, 'w1', 'idle', 'claude')));
   assert.equal(store.view().length, 6);
   assert.deepEqual(panes(store.view()), ['w1:p0', 'w1:p1', 'w1:p2', 'w1:p3', 'w1:p4', 'w1:p5']);
+});
+
+test('overflow is reported once, not on every refresh, and re-arms after it clears', () => {
+  const warnings: Array<Record<string, unknown> | undefined> = [];
+  const log: Logger = { info() {}, warn: (_m, fields) => void warnings.push(fields), error() {} };
+  const store = new Store(log, { settleMs: SETTLE });
+  const listOf = (n: number) =>
+    Array.from({ length: n }, (_, i) => agent(`w1:p${i}`, 'w1', 'idle', 'claude'));
+
+  store.applyAgents(listOf(8));
+  store.applyAgents(listOf(8));
+
+  // agent.list refreshes every couple of seconds forever; warning per pass
+  // would bury every other line in the log.
+  assert.equal(warnings.length, 1, 'the same overflow must not be re-reported');
+  assert.deepEqual(warnings[0], { agents: 8, slots: 6, hidden: 2 });
+
+  // Dropping back within the slot count re-arms it, so a later overflow is
+  // reported rather than swallowed by the first one having already fired.
+  store.applyAgents(listOf(3));
+  store.applyAgents(listOf(7));
+
+  assert.equal(warnings.length, 2, 'a fresh overflow after a quiet period is news again');
+  assert.deepEqual(warnings[1], { agents: 7, slots: 6, hidden: 1 });
 });
 
 // ---------------------------------------------------------------------------
@@ -201,21 +226,34 @@ test('no colour survives a reconnect and reseed', () => {
   assert.equal(store.view()[0]?.status, 'idle');
 });
 
-test('reseed does not emit a transition spanning the outage', async () => {
+test('the first transition after a reseed is dated from the reseed, not from before the outage', async () => {
   const store = newStore();
   const seen: Transition[] = [];
+  const OUTAGE = 40;
 
   store.applySeed(mixedSession());
   store.applyPaneStatus('w1:p1', 'working');
-  await delay(30);
+  await delay(OUTAGE);
 
   store.on('transition', (t: Transition) => seen.push(t));
   store.setDisconnected();
   store.applySeed(mixedSession());
 
-  for (const t of seen) {
-    assert.ok(t.durationMs < 25, `fabricated duration ${t.durationMs}ms`);
-  }
+  // The reseed itself is silent: every agent is rebuilt from scratch at idle,
+  // so there is no change to narrate. Asserting only over what the reseed emits
+  // therefore asserts over nothing at all.
+  assert.equal(seen.length, 0, 'a rebuild is not a transition');
+
+  // The cleared statusSince is observable only on the NEXT real change. A
+  // surviving entry would date this from before the outage and write that
+  // fabricated duration into metrics.jsonl on every single reconnect.
+  store.applyPaneStatus('w1:p1', 'blocked');
+
+  assert.equal(seen.length, 1, 'a real change after the reseed still reports');
+  assert.ok(
+    seen[0]!.durationMs < OUTAGE / 2,
+    `duration ${seen[0]!.durationMs}ms spans the ${OUTAGE}ms outage`,
+  );
 });
 
 test('a reseed carrying a non-idle status is still not a transition', () => {
@@ -297,6 +335,21 @@ test('workspace labels resolve and follow renames', () => {
   store.renameWorkspace('w1', 'fix-auth');
   assert.equal(store.view()[0]?.label, 'fix-auth/claude');
   assert.equal(store.view()[1]?.label, 'fix-auth/omp', 'both agents follow the rename');
+});
+
+test('an agent moved to an unlabelled workspace stops naming the old one', () => {
+  const store = newStore();
+  store.applySeed(mixedSession());
+  assert.equal(store.view()[0]?.label, 'herdr-micro/claude');
+
+  // The agent is now in w3, which no workspace.list has described yet. Keeping
+  // the label already held would name herdr-micro -- a workspace this agent has
+  // left -- which reads as correct and is not. The id is the honest answer.
+  store.applyAgents([agent('w1:p1', 'w3', 'working')]);
+  assert.equal(store.view()[0]?.label, 'w3/claude');
+
+  store.applyWorkspaces([workspace('w3', 'fix-auth', 3)]);
+  assert.equal(store.view()[0]?.label, 'fix-auth/claude', 'and repairs when the label lands');
 });
 
 test('an agent in an unlabelled workspace falls back to the id', () => {

@@ -59,33 +59,39 @@ export function labelFor(a: Agent): string {
   return `${a.workspaceLabel}/${a.kind}`;
 }
 
-/** A repeated id would occupy two keys and displace a real agent. */
-function dedupe(ids: string[]): string[] {
-  return [...new Set(ids)];
+export type StoreEvents = {
+  /** The rendered slot view. Fires only when it actually differs. */
+  changed: (view: SlotView[]) => void;
+  /** One status change, already settled. */
+  transition: (t: Transition) => void;
+};
+
+export declare interface Store {
+  on<K extends keyof StoreEvents>(e: K, l: StoreEvents[K]): this;
+  emit<K extends keyof StoreEvents>(e: K, ...a: Parameters<StoreEvents[K]>): boolean;
 }
 
 /**
- * Holds agent state and turns it into six slots.
+ * Holds agent state and turns it into six slots. It exists to absorb two
+ * things that would otherwise reach the pad:
  *
- * Two things this class exists to absorb:
+ *  1. Volume. herdr can emit ~10 events/sec for a single redrawing pane
+ *     (measured: 75 in 8s). `changed` fires only when the rendered view
+ *     actually differs, which is where all the deduplication happens.
  *
- *  1. Volume. `pane.updated` arrives at ~10 Hz for the focused pane
- *     unconditionally. `changed` fires only when the rendered view actually
- *     differs, which is the dedupe point the whole send-on-change policy rests
- *     on.
+ *  2. Flicker. herdr reports `unknown` freely during process churn, and
+ *     painting it immediately makes keys blink. See applyStatus.
  *
- *  2. Flicker. herdr reports `unknown` freely during process churn. Painting
- *     that immediately makes keys blink constantly, so brief unknown holds the
- *     last colour and only settles after UNKNOWN_SETTLE_MS.
- *
- * Slot position is `order[i]` and nothing else, and `order` comes from
- * agent.list -- which herdr returns grouped by workspace and stable across
- * status changes. Holding no second slot array makes "a key never moves on a
- * status change" structural rather than a rule to remember.
+ * Slot position is `order[i]` and nothing else. Keeping no second slot array
+ * makes "a key never moves on a status change" structural rather than a rule
+ * someone has to remember.
  */
 export class Store extends EventEmitter {
   private agents = new Map<string, Agent>();
-  /** Pane ids in agent.list order. Slot N renders order[N]. */
+  /**
+   * Pane ids in agent.list order, de-duplicated -- a repeated id would occupy
+   * two keys and displace a real agent. Slot N renders order[N].
+   */
   private order: string[] = [];
   /** workspace id -> label. AgentInfo carries only the id. */
   private labels = new Map<string, string>();
@@ -117,22 +123,24 @@ export class Store extends EventEmitter {
     this.clearAllSettles();
     this.agents.clear();
     this.labels.clear();
-    // Must be cleared too: seeded agents start at `idle` and are then given
-    // their real status, so a surviving statusSince would date the resulting
-    // transition from before the outage and write a fabricated duration into
-    // metrics.jsonl on every reconnect.
+    // Cleared too: seeded agents start at `idle` and are then given their real
+    // status, so a surviving timestamp would date that transition from before
+    // the outage and write a fabricated duration to metrics on every reconnect.
     this.statusSince.clear();
     this.connected = true;
 
     for (const w of snapshot.workspaces ?? []) this.labels.set(w.workspace_id, w.label);
 
+    // Only panes running an agent get a key.
     const agentPanes = (snapshot.panes ?? []).filter((p) => p.agent);
-    this.order = dedupe(agentPanes.map((p) => p.pane_id));
+    this.order = [...new Set(agentPanes.map((p) => p.pane_id))];
+
     for (const p of agentPanes) {
       if (!this.agents.has(p.pane_id)) {
         this.agents.set(p.pane_id, this.newAgent(p.pane_id, p.workspace_id, p.agent ?? '?'));
       }
     }
+
     // Status second, so settling sees a fully-built record.
     for (const p of agentPanes) {
       const a = this.agents.get(p.pane_id);
@@ -162,8 +170,6 @@ export class Store extends EventEmitter {
   }
 
   // -------------------------------------------------------------------------
-  // Authoritative reconciliation
-  // -------------------------------------------------------------------------
 
   /**
    * Authoritative membership, order and status, from a periodic `agent.list`.
@@ -174,64 +180,80 @@ export class Store extends EventEmitter {
    * indefinitely.
    */
   applyAgents(list: AgentInfo[]): void {
-    const incoming = dedupe(list.map((a) => a.pane_id));
+    const incoming = new Set(list.map((a) => a.pane_id));
 
+    // Anything herdr no longer lists has gone, whatever events did or did not arrive.
     for (const paneId of [...this.agents.keys()]) {
-      if (!incoming.includes(paneId)) this.dropAgent(paneId);
+      if (!incoming.has(paneId)) this.dropAgent(paneId);
     }
 
     for (const info of list) {
       let a = this.agents.get(info.pane_id);
+
       if (a) {
         a.workspaceId = info.workspace_id;
-        a.workspaceLabel = this.labels.get(info.workspace_id) ?? a.workspaceLabel;
+        // Falls back to the id, never to the label already held: that one
+        // belongs to the workspace the agent just left, so an agent moved into
+        // a workspace no label is known for yet would keep naming the old one.
+        // The id is ugly and correct, and the next workspace.list repairs it.
+        a.workspaceLabel = this.labels.get(info.workspace_id) ?? info.workspace_id;
         a.kind = info.agent;
       } else {
         a = this.newAgent(info.pane_id, info.workspace_id, info.agent);
         this.agents.set(info.pane_id, a);
       }
+
       this.applyStatus(a, info.agent_status, false);
     }
 
-    this.order = incoming;
+    // Set iteration is insertion order, so slots follow herdr's own ordering.
+    this.order = [...incoming];
+
     this.warnOverflow();
     this.notify();
   }
 
   /** Workspace labels only. Membership comes from agent.list. */
   applyWorkspaces(list: WorkspaceInfo[]): void {
-    let changed = false;
-    for (const w of list) {
-      if (this.labels.get(w.workspace_id) !== w.label) {
-        this.labels.set(w.workspace_id, w.label);
-        changed = true;
-      }
-    }
-    if (!changed) return;
-    for (const a of this.agents.values()) {
-      a.workspaceLabel = this.labels.get(a.workspaceId) ?? a.workspaceLabel;
-    }
-    this.notify();
+    this.setLabels(list.map((w) => [w.workspace_id, w.label]));
   }
 
   renameWorkspace(workspaceId: string, label: string): void {
-    if (this.labels.get(workspaceId) === label) return;
-    this.labels.set(workspaceId, label);
-    for (const a of this.agents.values()) {
-      if (a.workspaceId === workspaceId) a.workspaceLabel = label;
+    this.setLabels([[workspaceId, label]]);
+  }
+
+  /** Relabel, then re-derive every agent's label from the map. */
+  private setLabels(entries: Array<[string, string]>): void {
+    let changed = false;
+
+    for (const [id, label] of entries) {
+      if (this.labels.get(id) === label) continue;
+      this.labels.set(id, label);
+      changed = true;
     }
+
+    if (!changed) return;
+
+    for (const a of this.agents.values()) {
+      a.workspaceLabel = this.labels.get(a.workspaceId) ?? a.workspaceLabel;
+    }
+
     this.notify();
   }
 
+  /** Forget an agent entirely, including its pending timer. */
   private dropAgent(paneId: string): void {
     const a = this.agents.get(paneId);
     if (a) this.clearSettle(a);
+
     this.agents.delete(paneId);
     this.statusSince.delete(paneId);
   }
 
+  /** Warns once per overflow, and re-arms when it clears. */
   private warnOverflow(): void {
     const overflow = this.order.length - SLOT_COUNT;
+
     if (overflow > 0 && !this.warnedOverflow) {
       this.warnedOverflow = true;
       this.log.warn('more agents than slots; extras are not displayed', {
@@ -272,9 +294,10 @@ export class Store extends EventEmitter {
   }
 
   /**
-   * Topology only. `pane.updated` must never set status: it fires only for the
-   * focused pane, on a ~10 Hz timer rather than on change, so a lagging sample
-   * could regress a key with no real transition behind it.
+   * Topology only. `pane.updated` must never set status. It fires for whichever
+   * pane is redrawing -- not necessarily the focused one, and not necessarily
+   * an agent at all -- at ~10 Hz driven by title churn rather than by change,
+   * so a lagging sample could regress a key with no real transition behind it.
    */
   applyPane(pane: PaneInfo): void {
     const a = this.agents.get(pane.pane_id);
@@ -290,31 +313,37 @@ export class Store extends EventEmitter {
    * biggest anti-flicker measure in the daemon.
    */
   private applyStatus(a: Agent, next: AgentStatus, seeding: boolean): void {
+    // A real status arrives: take it, and abandon any pending settle.
     if (next !== 'unknown') {
       this.clearSettle(a);
       this.commitStatus(a, next, seeding);
       return;
     }
 
+    // Nothing to hold on to at seed time, so there is nothing to protect.
     if (seeding) {
       this.commitStatus(a, 'idle', true);
       return;
     }
+
     if (a.unknownTimer) return; // already settling; keep the existing timer
 
-    // Where to settle, captured now. `done` means work finished that the user
-    // has not seen, and only herdr collapses it to idle once they look.
-    // Settling it to idle on a timer would silently eat the completion, and
-    // because status events are edge-driven nothing re-asserts it afterwards.
+    // Where to settle, captured now rather than when the timer fires. `done`
+    // means work finished that the user has not seen, and only herdr clears it
+    // once they look; settling to idle would silently eat the completion, and
+    // nothing re-asserts it afterwards because status events are edge-driven.
     const settleTo: AgentStatus = a.status === 'done' ? 'done' : 'idle';
+
     a.unknownTimer = setTimeout(() => {
       // Re-look-up by id: the agent may have been dropped meanwhile.
       const live = this.agents.get(a.paneId);
       if (!live?.unknownTimer) return;
+
       live.unknownTimer = null;
       this.commitStatus(live, settleTo);
       this.notify();
     }, this.settleMs);
+
     a.unknownTimer.unref?.();
   }
 
@@ -341,12 +370,16 @@ export class Store extends EventEmitter {
    */
   private commitStatus(a: Agent, next: AgentStatus, seeding = false): void {
     if (a.status === next) return;
+
     const now = Date.now();
     const since = this.statusSince.get(a.paneId) ?? now;
     const from = a.status;
+
     a.status = next;
     this.statusSince.set(a.paneId, now);
+
     if (seeding) return;
+
     const transition: Transition = {
       paneId: a.paneId,
       label: labelFor(a),
@@ -354,6 +387,7 @@ export class Store extends EventEmitter {
       to: next,
       durationMs: now - since,
     };
+
     this.emit('transition', transition);
   }
 
@@ -361,11 +395,14 @@ export class Store extends EventEmitter {
   // Output
   // -------------------------------------------------------------------------
 
+  /** Six slots, always. Agents past the sixth are held but not shown. */
   view(): SlotView[] {
     const out: SlotView[] = [];
+
     for (let slot = 0; slot < SLOT_COUNT; slot++) {
       const id = this.order[slot];
       const a = id ? this.agents.get(id) : undefined;
+
       out.push(
         a
           ? {
@@ -373,25 +410,32 @@ export class Store extends EventEmitter {
               paneId: a.paneId,
               workspaceId: a.workspaceId,
               label: labelFor(a),
+              // Disconnected shows idle everywhere: better blank than stale.
               status: this.connected ? a.status : 'idle',
             }
           : { slot, paneId: null, workspaceId: null, label: null, status: null },
       );
     }
+
     return out;
   }
 
-  /** Slot -> agent, for the gesture bindings in M5/M6. */
+  /** Slot -> agent: what pressing that agent key focuses. See PadControls.handleKey. */
   agentForSlot(slot: number): Agent | null {
     const id = this.order[slot];
     return id ? (this.agents.get(id) ?? null) : null;
   }
 
-  /** The dedupe gate: fires only when the rendered view actually differs. */
+  /**
+   * The dedupe gate: fires only when the rendered view actually differs.
+   * Every mutation above calls this, so most of them cost nothing.
+   */
   private notify(): void {
     const view = this.view();
     const key = JSON.stringify(view);
+
     if (key === this.lastView) return;
+
     this.lastView = key;
     this.emit('changed', view);
   }

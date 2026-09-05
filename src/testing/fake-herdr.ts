@@ -2,7 +2,15 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import net from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { AgentInfo, EventFrame, SessionSnapshot } from '../herdr/rpc.js';
+import type {
+  AgentInfo,
+  EventFrame,
+  SessionSnapshot,
+  TabInfo,
+  WorkspaceInfo,
+} from '../herdr/rpc.js';
+import { isHerdrKey } from '../herdr/rpc.js';
+import { asArray, isRecord } from '../json.js';
 import { snapshot as snapshotFixture } from './fixtures.js';
 
 /**
@@ -30,6 +38,9 @@ export type FakeHerdr = {
   dropAll(): void;
   setSnapshot(snapshot: SessionSnapshot): void;
   setAgents(agents: AgentInfo[]): void;
+  setWorkspaces(workspaces: WorkspaceInfo[]): void;
+  setTabs(tabs: Record<string, TabInfo[]>): void;
+  setCurrentPane(paneId: string | null): void;
   readonly openConnections: number;
   waitFor(predicate: () => boolean, timeoutMs?: number): Promise<void>;
   stop(): Promise<void>;
@@ -54,7 +65,30 @@ export type FakeOptions = {
   ackDelayMs?: number;
   /** Reject only per-pane status subscribes, leaving the global stream healthy. */
   failPaneSubscribe?: boolean;
+  workspaces?: WorkspaceInfo[];
+  /** Tabs per workspace id; tab.list answers from this map. */
+  tabs?: Record<string, TabInfo[]>;
+  /** What pane.current reports; null means no pane is focused. */
+  currentPane?: string | null;
+  /**
+   * Methods that answer with an error envelope instead of a result. The popup
+   * toggle is defined by which of its three methods fail, so testing it needs
+   * this rather than another bespoke flag.
+   */
+  failMethods?: string[];
 };
+
+/** Methods that only acknowledge; the assertion is that they were called at all. */
+const MUTATIONS = new Set([
+  'workspace.focus',
+  'tab.focus',
+  'agent.focus',
+  'pane.focus_direction',
+  'pane.send_text',
+  'notification.show',
+  'popup.close',
+  'plugin.pane.open',
+]);
 
 export async function startFakeHerdr(opts: FakeOptions = {}): Promise<FakeHerdr> {
   // macOS caps sun_path at 104 bytes; a short tmp dir keeps well inside it.
@@ -72,15 +106,32 @@ export async function startFakeHerdr(opts: FakeOptions = {}): Promise<FakeHerdr>
   // disagreement.
   let agents: AgentInfo[] =
     opts.agents ??
-    (opts.snapshot?.panes ?? [])
-      .filter((p) => p.agent)
-      .map((p) => ({
-        agent: p.agent as string,
-        agent_status: p.agent_status,
-        pane_id: p.pane_id,
-        tab_id: p.tab_id,
-        workspace_id: p.workspace_id,
-      }));
+    // flatMap rather than filter().map(): filter does not narrow `agent` away
+    // from null, and asserting it back was the only thing holding the shape up.
+    (opts.snapshot?.panes ?? []).flatMap((p) =>
+      p.agent
+        ? [
+            {
+              agent: p.agent,
+              agent_status: p.agent_status,
+              pane_id: p.pane_id,
+              tab_id: p.tab_id,
+              workspace_id: p.workspace_id,
+            },
+          ]
+        : [],
+    );
+
+  let workspaces: WorkspaceInfo[] = opts.workspaces ?? [];
+  let tabs: Record<string, TabInfo[]> = opts.tabs ?? {};
+  let currentPane: string | null = opts.currentPane ?? null;
+  const failMethods = new Set(opts.failMethods ?? []);
+
+  const dropEveryConnection = () => {
+    for (const s of open) s.destroy();
+    open.clear();
+    subscribers.clear();
+  };
 
   const server = net.createServer((socket) => {
     const conn = ++connections;
@@ -101,55 +152,61 @@ export async function startFakeHerdr(opts: FakeOptions = {}): Promise<FakeHerdr>
         const line = buf.slice(0, i);
         buf = buf.slice(i + 1);
         if (!line.trim()) continue;
-        if (handled) continue; // one request per connection, like the real server
+        // The real server does not merely ignore a second request on a
+        // connection: it CLOSES the connection, taking any live subscription
+        // with it. Measured against herdr 0.8.2 -- see tools/herdr-probe.mjs,
+        // which times a control socket against one that sends a second
+        // request. Ignoring it here would let a multiplexing bug pass.
+        if (handled) {
+          socket.destroy();
+          return;
+        }
         handled = true;
 
-        const req = JSON.parse(line) as { id: string; method: string; params: unknown };
-        requests.push({
-          conn,
-          method: req.method,
-          params: (req.params ?? {}) as Record<string, unknown>,
-        });
+        const parsed: unknown = JSON.parse(line);
+        if (!isRecord(parsed)) return;
+
+        const req = {
+          id: typeof parsed.id === 'string' ? parsed.id : '',
+          method: typeof parsed.method === 'string' ? parsed.method : '',
+        };
+        const params = isRecord(parsed.params) ? parsed.params : {};
+        requests.push({ conn, method: req.method, params });
 
         if (opts.stallRequests) return;
 
         if (opts.dropAllAfterRequests && requests.length === opts.dropAllAfterRequests) {
-          for (const s2 of open) s2.destroy();
-          open.clear();
-          subscribers.clear();
+          dropEveryConnection();
           return;
         }
 
         if (opts.dropAllOnMethod && req.method === opts.dropAllOnMethod) {
-          for (const s2 of open) s2.destroy();
-          open.clear();
-          subscribers.clear();
+          dropEveryConnection();
+          return;
+        }
+
+        const reply = (result: Record<string, unknown>) =>
+          socket.write(`${JSON.stringify({ id: req.id, result })}\n`);
+        const fail = (message: string) =>
+          socket.write(`${JSON.stringify({ id: req.id, error: { message } })}\n`);
+
+        if (failMethods.has(req.method)) {
+          fail(`${req.method} refused`);
           return;
         }
 
         if (req.method === 'session.snapshot') {
-          socket.write(
-            `${JSON.stringify({ id: req.id, result: { type: 'session_snapshot', snapshot } })}\n`,
-          );
+          reply({ type: 'session_snapshot', snapshot });
         } else if (req.method === 'agent.list') {
-          socket.write(
-            `${JSON.stringify({ id: req.id, result: { type: 'agent_list', agents } })}\n`,
-          );
+          reply({ type: 'agent_list', agents });
         } else if (req.method === 'events.subscribe') {
           if (opts.stallSubscribe) return;
-          if (
-            opts.failPaneSubscribe &&
-            JSON.stringify(req.params).includes('agent_status_changed')
-          ) {
-            socket.write(
-              `${JSON.stringify({ id: req.id, error: { message: 'pane subscribe refused' } })}\n`,
-            );
+          if (opts.failPaneSubscribe && JSON.stringify(params).includes('agent_status_changed')) {
+            fail('pane subscribe refused');
             return;
           }
           if (opts.rejectSubscribe) {
-            socket.write(
-              `${JSON.stringify({ id: req.id, error: { message: opts.rejectSubscribe } })}\n`,
-            );
+            fail(opts.rejectSubscribe);
             return;
           }
           subscribers.add(socket);
@@ -160,6 +217,36 @@ export async function startFakeHerdr(opts: FakeOptions = {}): Promise<FakeHerdr>
             : ack;
           if (opts.ackDelayMs) setTimeout(() => socket.write(payload), opts.ackDelayMs);
           else socket.write(payload);
+        } else if (req.method === 'workspace.list') {
+          reply({ type: 'workspace_list', workspaces });
+        } else if (req.method === 'tab.list') {
+          const id = String(params.workspace_id ?? '');
+          reply({ type: 'tab_list', tabs: tabs[id] ?? [] });
+        } else if (req.method === 'pane.current') {
+          // A pane_id-less envelope is how herdr reports "nothing focused", and
+          // the client is meant to treat that as a no-op rather than an error.
+          reply({
+            type: 'pane_current',
+            pane: currentPane === null ? {} : { pane_id: currentPane },
+          });
+        } else if (req.method === 'pane.send_keys') {
+          // The real server validates every key name before writing a byte and
+          // answers `invalid_key` for anything outside its vocabulary. Echoing
+          // back whatever it was handed is what let the daemon ship `pageup`
+          // and `pagedown`: scroll mode's tests passed while herdr rejected
+          // every request the dial actually sent.
+          const bad = asArray(params.keys)
+            .filter((k): k is string => typeof k === 'string')
+            .find((k) => !isHerdrKey(k));
+
+          if (bad !== undefined) fail(`unsupported key ${bad}`);
+          else reply({ type: 'ok' });
+        } else if (MUTATIONS.has(req.method)) {
+          reply({ type: 'ok' });
+        } else {
+          // Loud beats slow: an unhandled method would otherwise hang the client
+          // until its request timeout and surface as an unrelated flake.
+          fail(`fake-herdr has no handler for ${req.method}`);
         }
       }
     });
@@ -180,16 +267,21 @@ export async function startFakeHerdr(opts: FakeOptions = {}): Promise<FakeHerdr>
     pushRaw(bytes) {
       for (const s of subscribers) s.write(bytes);
     },
-    dropAll() {
-      for (const s of open) s.destroy();
-      open.clear();
-      subscribers.clear();
-    },
+    dropAll: dropEveryConnection,
     setSnapshot(next) {
       snapshot = next;
     },
     setAgents(next) {
       agents = next;
+    },
+    setWorkspaces(next) {
+      workspaces = next;
+    },
+    setTabs(next) {
+      tabs = next;
+    },
+    setCurrentPane(next) {
+      currentPane = next;
     },
     get openConnections() {
       return open.size;
@@ -200,10 +292,19 @@ export async function startFakeHerdr(opts: FakeOptions = {}): Promise<FakeHerdr>
         if (predicate()) return;
         await new Promise((r) => setTimeout(r, 5));
       }
-      throw new Error('waitFor timed out');
+      // Most tests here wait on several conditions in turn, so a bare "timed
+      // out" names neither which one stalled nor how far the client got. The
+      // predicate's own source is the only description available, and the
+      // request log is what almost every one of them is really asking about.
+      const source = predicate.toString().replace(/\s+/g, ' ').slice(0, 200);
+      throw new Error(
+        `waitFor timed out after ${timeoutMs}ms: ${source}\n` +
+          `  requests (${requests.length}): ${requests.map((r) => r.method).join(', ') || '(none)'}\n` +
+          `  connections: ${connections} opened, ${open.size} still open`,
+      );
     },
     async stop() {
-      for (const s of open) s.destroy();
+      dropEveryConnection();
       await new Promise<void>((resolve) => server.close(() => resolve()));
       rmSync(dir, { recursive: true, force: true });
     },
