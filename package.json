@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "description": "Ambient agent-status surface for herdr on a Work Louder Creator Micro 2 Pro",
+  "license": "MIT",
   "engines": {
     "node": ">=20"
   },
