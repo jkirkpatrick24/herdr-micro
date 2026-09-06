@@ -121,6 +121,27 @@ test('overflow is reported once, not on every refresh, and re-arms after it clea
   assert.deepEqual(warnings[1], { agents: 7, slots: 6, hidden: 1 });
 });
 
+test('an overflow cleared by closing panes re-arms the warning too', () => {
+  const warnings: Array<Record<string, unknown> | undefined> = [];
+  const log: Logger = { info() {}, warn: (_m, fields) => void warnings.push(fields), error() {} };
+  const store = new Store(log, { settleMs: SETTLE });
+  const listOf = (n: number) =>
+    Array.from({ length: n }, (_, i) => agent(`w1:p${i}`, 'w1', 'idle', 'claude'));
+
+  store.applyAgents(listOf(8));
+  assert.equal(warnings.length, 1, 'the overflow is reported');
+
+  // Panes closing is the ordinary way an overflow clears, and it goes through
+  // removePane rather than agent.list. That path did not re-arm the warning,
+  // so the next overflow was swallowed by the first one having already fired.
+  store.removePane('w1:p7');
+  store.removePane('w1:p6');
+  store.applyAgents(listOf(8));
+
+  assert.equal(warnings.length, 2, 'the overflow that came back is news again');
+  assert.deepEqual(warnings[1], { agents: 8, slots: 6, hidden: 2 });
+});
+
 // ---------------------------------------------------------------------------
 // unknown-settling -- the anti-flicker measure
 // ---------------------------------------------------------------------------
@@ -283,6 +304,30 @@ test('a reseed carrying a non-idle status is still not a transition', () => {
   store.applyPaneStatus('w1:p1', 'blocked');
   assert.equal(seen.length, 1, 'a real change after the reseed still reports');
   assert.equal(seen[0]?.from, 'working', 'dated from the state the seed established');
+});
+
+test('an agent seeded idle is dated from the seed, not from its first change', async () => {
+  const store = newStore();
+  const seen: Transition[] = [];
+  store.on('transition', (t: Transition) => seen.push(t));
+  const IDLE_FOR = 40;
+
+  // The case the non-idle fixture above cannot reach. applySeed builds every
+  // agent at `idle` and then hands it its real status, so an agent herdr
+  // reports as idle is committed a status it already holds -- and that commit
+  // is the only chance it gets to be dated. Left unstamped, `since ?? now`
+  // dated the first real change from the change itself and every idle->working
+  // row in metrics.jsonl read 0ms, zeroing exactly the durations the file is
+  // kept to measure.
+  store.applySeed(mixedSession());
+  await delay(IDLE_FOR);
+  store.applyPaneStatus('w1:p1', 'working');
+
+  assert.equal(seen.length, 1, 'the change after the seed still reports');
+  assert.ok(
+    seen[0]!.durationMs >= IDLE_FOR / 2,
+    `idle duration ${seen[0]!.durationMs}ms does not span the ${IDLE_FOR}ms it was idle for`,
+  );
 });
 
 // ---------------------------------------------------------------------------

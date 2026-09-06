@@ -290,6 +290,10 @@ export class Store extends EventEmitter {
     if (!this.agents.has(paneId)) return;
     this.dropAgent(paneId);
     this.order = this.order.filter((id) => id !== paneId);
+    // Closing panes is how an overflow ordinarily clears, so this path has to
+    // re-arm the warning too. Without it `warnedOverflow` stayed latched and
+    // the next overflow was swallowed by the first one having already fired.
+    this.warnOverflow();
     this.notify();
   }
 
@@ -369,9 +373,21 @@ export class Store extends EventEmitter {
    * next real change is dated from the seed.
    */
   private commitStatus(a: Agent, next: AgentStatus, seeding = false): void {
-    if (a.status === next) return;
-
     const now = Date.now();
+
+    // A seed that re-asserts the status an agent already holds is not a
+    // change, but it still has to DATE that state. Every agent is built at
+    // `idle` and then handed its real status, so an agent herdr reports as
+    // idle -- the common case, and the one every reconnect rebuilds -- takes
+    // this branch. Returning without the stamp left it with no entry at all,
+    // and `since ?? now` then dated its first real change from the change
+    // itself: every idle->working row in metrics.jsonl read `duration_ms: 0`,
+    // silently zeroing the idle durations the file exists to measure.
+    if (a.status === next) {
+      if (seeding) this.statusSince.set(a.paneId, now);
+      return;
+    }
+
     const since = this.statusSince.get(a.paneId) ?? now;
     const from = a.status;
 
