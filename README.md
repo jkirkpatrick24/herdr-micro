@@ -134,7 +134,20 @@ npm run build
 node dist/main.js
 ```
 
-`npm run dev` builds and runs in one step.
+`npm run dev` builds and runs in one step. Disable the plugin first if it is
+installed, or you will be running two daemons:
+
+```sh
+herdr plugin disable jkirkpatrick24.herdr-micro
+```
+
+herdr starts the plugin's daemon with the session, and the pad is opened
+non-exclusively, so a second copy opens it quite happily and then cannot write
+to it -- `IOHIDDeviceSetReport failed ... not permitted` on every paint, from
+whichever instance lost. Both copies also subscribe to herdr and both append to
+`metrics.jsonl`, so every transition is recorded twice. The daemon now gives up
+a handle it cannot write to after three consecutive rejected writes and
+re-enumerates on a backoff, but the fix is to run one of them.
 
 macOS gates the pad behind Input Monitoring, granted per calling process.
 Without it the open fails outright -- no lighting and no input, just

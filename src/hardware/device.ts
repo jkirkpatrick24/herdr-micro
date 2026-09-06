@@ -53,6 +53,22 @@ type DeviceHandle = HidHandle;
 
 const RETRY_MS = 3000;
 
+/**
+ * Consecutive rejected writes before the handle is given up on. One failure is
+ * noise -- a pad yanked mid-write, a queue draining against a handle that has
+ * just gone -- so this sits high enough that a single repaint cannot tear down
+ * a working pad, and low enough that a useless one is dropped in under a
+ * second of painting.
+ */
+export const WRITE_FAILURE_LIMIT = 3;
+
+/**
+ * Ceiling for the retry after a handle that opened but could not be written
+ * to. The causes outlive any one retry, so this backs off rather than
+ * re-enumerating every few seconds forever.
+ */
+const RETRY_MAX_MS = 30_000;
+
 export type CreatorMicroOptions = {
   hid?: HidBackend;
   /** How long to wait before re-enumerating after a miss or a drop. */
@@ -89,6 +105,14 @@ export class CreatorMicro extends EventEmitter {
 
   private readonly hid: HidBackend;
   private readonly retryMs: number;
+  /**
+   * Consecutive rejected writes on the live handle. Cleared by any success,
+   * and deliberately NOT by a reconnect: a handle that reopens and still
+   * cannot be written to has to keep escalating rather than start over.
+   */
+  private writeFailures = 0;
+  /** Retry delay. Escalates only for a pad that opened and then refused writes. */
+  private retryDelay: number;
 
   constructor(
     private readonly log: Logger,
@@ -97,6 +121,7 @@ export class CreatorMicro extends EventEmitter {
     super();
     this.hid = opts.hid ?? nodeHid;
     this.retryMs = opts.retryMs ?? RETRY_MS;
+    this.retryDelay = this.retryMs;
     this.rpc = new RpcReassembler((chars) =>
       log.warn('oversized pad notification; resyncing at the next newline', { chars }),
     );
@@ -163,6 +188,10 @@ export class CreatorMicro extends EventEmitter {
         );
 
       if (!info?.path) {
+        // An absent pad is the ordinary case and says nothing about whether the
+        // daemon can drive one, so a replug is caught at the base cadence
+        // rather than behind a backoff earned by a different problem.
+        this.retryDelay = this.retryMs;
         this.scheduleRetry();
         return;
       }
@@ -194,7 +223,7 @@ export class CreatorMicro extends EventEmitter {
     this.retryTimer = setTimeout(() => {
       this.retryTimer = null;
       this.connect();
-    }, this.retryMs);
+    }, this.retryDelay);
     this.retryTimer.unref?.();
   }
 
@@ -241,12 +270,45 @@ export class CreatorMicro extends EventEmitter {
     const write = this.writeQueue.then(() => {
       if (!target || this.device !== target) throw new Error('Creator Micro is not connected');
       for (const report of encodeRpc(method, params, id)) target.write([...report]);
+      this.noteWrite(target, null);
     });
 
     // The queue swallows failures so one bad write cannot poison the chain;
     // the caller still sees them through the returned promise.
-    this.writeQueue = write.catch(() => {});
+    this.writeQueue = write.catch((error: Error) => this.noteWrite(target, error));
 
     return write;
+  }
+
+  /**
+   * A rejected write is best-effort at the call site, but a handle that keeps
+   * rejecting is not transient, and nothing else closes it: the daemon would
+   * hold a pad that reports `connected`, shows dark keys, and logs one warning
+   * per repaint for the life of the process.
+   *
+   * Observed with a second copy of the daemon running -- the pad opens
+   * nonExclusively for both, and only the first can drive the LEDs, so the
+   * second gets `IOHIDDeviceSetReport ... not permitted` on every paint. The
+   * handle is unusable but perfectly open, which is the one case the retry
+   * loop could not otherwise see.
+   */
+  private noteWrite(target: DeviceHandle | null, error: Error | null): void {
+    // Only the live handle counts. A write queued before a disconnect fails
+    // for a reason that says nothing about the handle that replaced it.
+    if (!target || this.device !== target) return;
+
+    if (!error) {
+      this.writeFailures = 0;
+      this.retryDelay = this.retryMs;
+      return;
+    }
+
+    if (++this.writeFailures < WRITE_FAILURE_LIMIT) return;
+
+    // Re-enumerating is the only move left, and it has to slow down: whatever
+    // is holding the pad or withholding the permission outlives one retry.
+    this.closeDevice(`writes rejected: ${error.message}`);
+    this.retryDelay = Math.min(this.retryDelay * 2, RETRY_MAX_MS);
+    this.scheduleRetry();
   }
 }

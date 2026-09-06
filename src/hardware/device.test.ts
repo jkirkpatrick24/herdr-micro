@@ -5,7 +5,7 @@ import { test } from 'vitest';
 import type { Logger } from '../log.js';
 import { fakeHid, padDeviceInfo } from '../testing/fake-pad.js';
 import { silentLogger } from '../testing/fixtures.js';
-import { CreatorMicro } from './device.js';
+import { CreatorMicro, WRITE_FAILURE_LIMIT } from './device.js';
 import { MAX_RPC_LINE_CHARS, type PadInput } from './protocol.js';
 
 const RETRY = 15;
@@ -306,6 +306,76 @@ test('a failed write does not wedge the queue behind it', async (t) => {
   // One RPC line, however many 64-byte reports it took to carry it.
   const sent = writtenRpc(hid.pad.writes).map((l) => JSON.parse(l).method);
   assert.deepEqual(sent, ['v.oai.thstatus'], 'the next paint still got through');
+});
+
+test('a handle that keeps rejecting writes is given up and re-enumerated', async (t) => {
+  const { hid, device, events } = pad();
+  t.onTestFinished(() => device.stop());
+  device.start();
+
+  // What a second copy of the daemon sees: the pad opens nonExclusively for
+  // both, and only the first can drive the LEDs. Nothing closes a handle that
+  // is open and useless, so before this the daemon reported `connected`
+  // forever, showed dark keys, and warned once per repaint.
+  hid.pad.failWrite(new Error('IOHIDDeviceSetReport failed: not permitted'));
+
+  for (let i = 0; i < WRITE_FAILURE_LIMIT; i++) {
+    await assert.rejects(() => device.setThreadLighting([]));
+  }
+
+  assert.equal(device.connected, false, 'the handle is dropped, not held open');
+  assert.ok(
+    events.some((e) => e.startsWith('disconnected:writes rejected:')),
+    `expected a rejected-write disconnect, got ${JSON.stringify(events)}`,
+  );
+
+  // And it comes back on its own once the pad is writable again.
+  hid.failOpen(null);
+  await delay(RETRY * 8);
+  assert.ok(events.lastIndexOf('connected') > 0, 'the retry loop re-enumerated');
+});
+
+test('a successful write clears the failures behind it', async (t) => {
+  const { hid, device, events } = pad();
+  t.onTestFinished(() => device.stop());
+  device.start();
+
+  // Two failures, then a success, then two more. Five rejected writes in a
+  // session must not add up to a teardown when the pad was working in between
+  // -- only a consecutive run means the handle itself is unusable.
+  for (const failing of [true, true, false, true, true]) {
+    hid.pad.failWrite(failing ? new Error('write failed') : null);
+    const write = device.setThreadLighting([]);
+    if (failing) await assert.rejects(() => write);
+    else await write;
+  }
+
+  assert.equal(device.connected, true, 'the pad is still held');
+  assert.ok(
+    !events.some((e) => e.startsWith('disconnected:')),
+    `expected no teardown, got ${JSON.stringify(events)}`,
+  );
+});
+
+test('the retry after a rejected-write teardown backs off', async (t) => {
+  const { hid, device } = pad();
+  t.onTestFinished(() => device.stop());
+  device.start();
+
+  hid.pad.failWrite(new Error('not permitted'));
+  for (let i = 0; i < WRITE_FAILURE_LIMIT; i++) {
+    await assert.rejects(() => device.setThreadLighting([]));
+  }
+
+  // The base cadence is for an unplugged pad, which is worth polling for. A
+  // pad that is present and unwritable is not: the cause outlives the retry,
+  // so re-enumerating at the same rate just moves the noise.
+  const opensAtTeardown = hid.opens;
+  await delay(RETRY);
+  assert.equal(hid.opens, opensAtTeardown, 'no reconnect at the base delay');
+
+  await delay(RETRY * 6);
+  assert.ok(hid.opens > opensAtTeardown, 'but it does come back');
 });
 
 test('writes are serialised in call order', async (t) => {
