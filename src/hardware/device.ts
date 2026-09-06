@@ -43,6 +43,16 @@ export type HidBackend = {
   open(path: string): HidHandle;
 };
 
+/**
+ * node-hid's default backend is the right one on both platforms, so there is
+ * nothing to select here -- but the Linux case is load-bearing enough to name.
+ *
+ * `connect` matches on usagePage, and only the hidraw driver reports it;
+ * node-hid's other Linux backend, libusb, leaves it undefined, so every one of
+ * the pad's interfaces would fail the filter and the daemon would report an
+ * absent pad on hardware that is plugged in. hidraw has been the default since
+ * node-hid 0.7.0, which holds as long as nothing calls setDriverType.
+ */
 const nodeHid: HidBackend = {
   list: () => devices(),
   // nonExclusive so the pad keeps working as a keyboard while the daemon holds it.

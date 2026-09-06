@@ -1,5 +1,7 @@
 # herdr-micro
 
+[![CI](https://github.com/jkirkpatrick24/herdr-micro/actions/workflows/ci.yml/badge.svg)](https://github.com/jkirkpatrick24/herdr-micro/actions/workflows/ci.yml)
+
 Ambient agent-status surface for [herdr](https://herdr.dev) on a Work Louder
 Creator Micro 2 Pro. Six keys show the live state of six herdr *agents*; a
 blocked agent holds steady amber and can be focused or interrupted from the
@@ -154,6 +156,25 @@ Without it the open fails outright -- no lighting and no input, just
 `Creator Micro unavailable` in the log and a retry every few seconds, with the
 status row still going to stdout. `node tools/hid-probe.mjs` says which barrier
 is being hit.
+
+Linux gates it on the hidraw node's permissions instead, and the same symptom
+means the same thing: the enumeration finds the pad and the open is refused.
+Grant it with a udev rule at `/etc/udev/rules.d/70-herdr-micro.rules`:
+
+```
+KERNEL=="hidraw*", ATTRS{idVendor}=="303a", ATTRS{idProduct}=="8298", TAG+="uaccess"
+```
+
+Then `sudo udevadm control --reload-rules && sudo udevadm trigger`, and replug
+the pad. `uaccess` hands the device to whoever is logged in at the seat, which
+is what you want on a desktop; a fixed `GROUP="plugdev", MODE="0660"` is the
+alternative for a headless box. The vendor and product ids must be lower-case
+hex, and they are the same two constants `hardware/protocol.ts` matches on.
+
+Linux support is CI-verified but not hardware-verified: the suite runs against
+a fake HID backend on both platforms, and nobody has yet driven a real pad from
+Linux. The daemon needs node-hid's hidraw backend there rather than libusb,
+which is the default -- see the note above `nodeHid` in `hardware/device.ts`.
 
 ## Configuration
 

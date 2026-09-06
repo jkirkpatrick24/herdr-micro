@@ -3,7 +3,7 @@ name = "Herdr Micro"
 version = "0.1.0"
 min_herdr_version = "0.8.0"
 description = "Agent status lights and controls on the Work Louder Creator Micro 2"
-platforms = ["macos"]
+platforms = ["macos", "linux"]
 
 [[build]]
 command = ["npm", "install"]
