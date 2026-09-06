@@ -6,7 +6,7 @@
     // These differ on purpose. `target` is the syntax level for emit; `lib` is
     // what the runtime provides. TypeScript never downlevels library methods,
     // so raising lib above target is exactly how you say "conservative output,
-    // Node 20 standard library" -- findLast and friends compile and emit as-is.
+    // Node 22 standard library" -- findLast and friends compile and emit as-is.
     "target": "ES2022",
     "lib": ["ES2023"],
     "module": "NodeNext",

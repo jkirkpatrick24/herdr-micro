@@ -6,7 +6,7 @@
   "description": "Ambient agent-status surface for herdr on a Work Louder Creator Micro 2 Pro",
   "license": "MIT",
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
@@ -26,7 +26,7 @@
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.12",
-    "@types/node": "^20.14.0",
+    "@types/node": "^22.0.0",
     "@vitest/coverage-v8": "^4.1.11",
     "typescript": "^5.5.0",
     "vitest": "^4.1.11"

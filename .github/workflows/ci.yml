@@ -27,7 +27,7 @@ jobs:
         # daemon needs -- see the note in device.ts.
         os: [macos-latest, ubuntu-latest]
         # The floor declared in package.json engines, and the current LTS.
-        node: ['20', '22']
+        node: ['22', '24']
 
     name: ${{ matrix.os }} / node ${{ matrix.node }}
 
