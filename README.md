@@ -38,15 +38,17 @@ printed on the pad, and the same names the config file binds:
 | `ACT06` | Toggle the agent popup | No |
 | `ACT07` | Send `Esc` to the focused pane | No |
 | `ACT08` / `ACT09` | Previous / next tab | No |
-| `ACT10` / `ACT11` | Nothing yet -- reserved for dictation | No |
+| `ACT10` / `ACT11` | Hold to dictate -- holds right `Cmd` at macOS | No |
 | `ACT12` | Send `Enter` to the focused pane | No |
 | Dial | Turn navigates, click cycles mode (harness included) | Ambient ring shows the mode |
 | Joystick | Focus the pane in that direction; arrow keys inside the harness layer | No |
 
 `ACT10` and `ACT11` are the two switches under the single wide keycap, so a
-press lands on one or the other; bind both to the same action if you bind
-either. They are unbound by default, reserved for dictation. The six agent keys
-are fixed -- only the `ACT` keys are bindable.
+press lands on one or the other; both carry the same keycode, so either switch
+does the same thing. They are the exception on the pad: they type a key at
+macOS instead of driving the daemon, which is what makes them usable as a
+dictation hotkey -- see [Dictation](#dictation). The six agent keys are fixed,
+and of the rest only `ACT06`--`ACT09` and `ACT12` are bindable.
 
 The key LEDs carry the status. Resting states are dimmed to a quarter
 brightness so a working or blocked key stands out across the room. The glyph is
@@ -91,11 +93,15 @@ and control failures to stderr, so the row stays parseable on its own.
 be running, exported from Work Louder's Layers editor. Import it there to
 reproduce the bindings; the daemon itself never reads the file.
 
-Every key, the encoder and the joystick bind to OpenAI vendor keycodes
-(`KV_OAI_AG00`--`AG05`, `KV_OAI_ACT06`--`ACT12`, `KV_OAI_ENC_*`, and a
-`"type": "VENDOR"` joystick). A key bound this way emits a `v.oai.hid` vendor
-report on the raw HID interface instead of a keystroke, so the pad drives the
-daemon without typing into whatever window is focused.
+Nearly every key, the encoder and the joystick bind to OpenAI vendor keycodes
+(`KV_OAI_AG00`--`AG05`, `KV_OAI_ACT06`--`ACT09`, `KV_OAI_ACT12`,
+`KV_OAI_ENC_*`, and a `"type": "VENDOR"` joystick). A key bound this way emits
+a `v.oai.hid` vendor report on the raw HID interface instead of a keystroke, so
+the pad drives the daemon without typing into whatever window is focused.
+
+The two dictation keys are the exception, and they invert that reasoning:
+reaching macOS is the entire point, so they carry a stock keycode instead. See
+[Dictation](#dictation).
 
 Stock keycodes work too, and `src/hardware/protocol.ts` decodes both off the
 same handle. `parseStandardInput` maps HID usages `0x04`--`0x09` onto
@@ -116,6 +122,60 @@ re-import.
 The export carries no `lights` block, so importing it leaves the backlight and
 underglow as they were. The daemon drives the key LEDs and the ambient ring
 over the vendor protocol regardless of what the layer stores.
+
+### Dictation
+
+`ACT10`/`ACT11` are a push-to-talk hotkey for whatever dictation app you run.
+Hold the wide keycap, speak, release: the app fills the focused pane's input
+box, and `ACT12` sends it. Nothing routes through herdr -- the text lands
+wherever the cursor already is, which is the pane you are looking at.
+
+The daemon has no dictation feature and needs none, so the key is generic
+rather than fixed. Any stock keycode works that
+
+1. types nothing visible, since stock keycodes do reach the focused window,
+2. stays clear of HID usages `0x04`--`0x10`, or the daemon reads it as a real
+   pad key, and
+3. your dictation app accepts as a hold-to-talk hotkey.
+
+The layer ships `KC_RGUI` -- right `Cmd`. A modifier satisfies the second
+condition by construction rather than by choosing a spare usage: `parseKeyboard`
+reads the keycode array with `report.subarray(3)`, so the modifier byte at
+index 1 is never looked at, and a modifier held on its own leaves an all-zero
+key array. The daemon does not decline the press; it never sees one. An
+ordinary key works too, and is declined rather than unseen: `standardKeyName`
+names anything outside `0x04`--`0x10` as `HID_xx`, the harness layer passes on
+it, and `PadControls` falls through to `'none'`. Either way, change both
+entries in the fourth row of `layout.base` and re-import.
+
+Both switches carry the same keycode on purpose -- a press lands on one or the
+other, and a keyboard report carries a given modifier bit or usage once however
+many switches hold it, so there is no double-trigger.
+
+Then point the dictation app at the same key. Wispr Flow ships its
+push-to-talk on `fn`, which the pad cannot send at all -- macOS reads `fn` off
+Apple's own vendor usage page rather than as an ordinary keycode -- so it has
+to be rebound: hold the wide keycap while Flow is listening for a new shortcut.
+Flow stores shortcuts as macOS virtual keycodes under `prefs.user.shortcuts` in
+`~/Library/Application Support/Wispr Flow/config.json`, where `63` is `fn` and
+`54` is right `Cmd`, which is the quickest way to confirm the rebind took.
+MacWhisper and superwhisper take the same key through their own hotkey
+settings. Turn off anything that appends a line break or submits for you, so
+the transcript lands in the input box without sending.
+
+Press and hold dictates; a double tap locks recording on. Giving both switches
+the same keycode is what makes the double tap survive landing on one switch and
+then the other.
+
+What a modifier costs is that it stays live while held: anything typed on the
+real keyboard mid-dictation arrives as a `Cmd` chord, and `Cmd`-`W` is a real
+thing to hit by accident. An ordinary key avoids the question if that ever
+bites.
+
+Dictated text arrives as a clipboard paste, so the terminal wraps it in
+bracketed paste and a newline mid-transcript cannot submit early. That is the
+reason not to route dictation through `pane.send_text` instead, which writes to
+the pty unwrapped -- see the note above `PageKey` in `src/herdr/rpc.ts`.
 
 ## The harness layer
 
@@ -159,7 +219,7 @@ under it, so the layer had to track which were down, whether a cap still down
 from cancelling a picker was asking for the layer or merely resting on it, and
 whether a control press whose round trip lost the race to the release still
 counted. One door removed all of it. `ACT10` and `ACT11` are reserved for
-dictation instead, which has not landed yet.
+dictation instead.
 
 `AG00`-`AG05` keep their normal meaning inside the layer: they still focus
 their agent, and the ring follows onto whatever harness that agent runs. The
@@ -357,7 +417,10 @@ enabled = true
   repeats. It does not have to name them all -- omitting one is how you drop a
   mode you never use. The first entry is the mode at startup.
 - **Button actions**: `popup`, `escape`, `tab-prev`, `tab-next`, `enter`,
-  `none`. Only the seven `ACT` keys are bindable; the agent keys are fixed.
+  `none`. The agent keys are fixed. `ACT10`/`ACT11` are listed above because
+  they are still the defaults, but they are inert while the layer binds them to
+  `KC_RGUI`: the press reaches macOS as a [dictation](#dictation) hotkey and
+  never arrives as `ACT10`. That leaves `ACT06`--`ACT09` and `ACT12` bindable.
 - **Joystick actions**: `pane` or `none`.
 - **`[harness] enabled`** turns the second layer off entirely: the layer is
   never constructed, and `harness` is dropped from `dial_mode_order` so the

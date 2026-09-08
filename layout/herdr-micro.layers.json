@@ -62,10 +62,10 @@
         ],
         [
           {
-            "keycode": "KV_OAI_ACT10"
+            "keycode": "KC_RGUI"
           },
           {
-            "keycode": "KV_OAI_ACT11"
+            "keycode": "KC_RGUI"
           },
           {
             "keycode": "KV_OAI_ACT12"
