@@ -89,7 +89,7 @@ export function agent(
   workspaceId: string,
   status: AgentStatus,
   kind = 'claude',
-  opts: { stateChangeSeq?: number } = {},
+  opts: { stateChangeSeq?: number; focused?: boolean } = {},
 ): AgentInfo {
   return {
     agent: kind,
@@ -98,6 +98,9 @@ export function agent(
     tab_id: `${workspaceId}:t1`,
     workspace_id: workspaceId,
     ...(opts.stateChangeSeq === undefined ? {} : { state_change_seq: opts.stateChangeSeq }),
+    // Absent unless asked for, matching the optional field on AgentInfo: the
+    // harness layer is the only reader, and it must cope with it missing.
+    ...(opts.focused === undefined ? {} : { focused: opts.focused }),
   };
 }
 

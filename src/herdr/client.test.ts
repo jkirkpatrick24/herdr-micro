@@ -24,7 +24,7 @@ import {
   resolveSocketPath,
   Subscriber,
 } from './client.js';
-import { Evt, reqSnapshot } from './rpc.js';
+import { Evt, Key, reqSnapshot } from './rpc.js';
 
 const FAST = { ackTimeoutMs: 200, requestTimeoutMs: 400, backoffMinMs: 20, backoffMaxMs: 60 };
 
@@ -329,6 +329,53 @@ test('requestOnce rejects an error envelope', async (t) => {
 
   const sub = new Subscriber(fake.path, [{ type: 'pane.updated' }], silentLogger, 't', 500);
   await assert.rejects(() => sub.start(), /nope/);
+});
+
+// ---------------------------------------------------------------------------
+// Pane input targets survive focus changes between a command and its submission
+// ---------------------------------------------------------------------------
+
+test('explicit pane input stays on the captured pane after focus changes or disappears', async (t) => {
+  const { fake, client } = await connected(t, { currentPane: 'p-agent' });
+  const target = await client.currentPaneId();
+  assert.equal(target, 'p-agent');
+  assert.ok(target);
+
+  fake.setCurrentPane('p-other');
+  await client.sendTextToPane(target, '/model');
+  fake.setCurrentPane(null);
+  await client.sendKeysToPane(target, [Key.enter]);
+
+  // Inspect the real socket boundary, not a stubbed client method. Both writes
+  // must reach the captured pane even though neither runs while it is focused.
+  assert.deepEqual(
+    fake.requests
+      .filter((req) => req.method === 'pane.send_text' || req.method === 'pane.send_keys')
+      .map(({ method, params }) => ({ method, params })),
+    [
+      { method: 'pane.send_text', params: { pane_id: 'p-agent', text: '/model' } },
+      { method: 'pane.send_keys', params: { pane_id: 'p-agent', keys: [Key.enter] } },
+    ],
+  );
+  assert.equal(fake.requests.filter((req) => req.method === 'pane.current').length, 1);
+});
+
+test('explicit pane keys propagate server-side key validation errors without focused input', async (t) => {
+  const { client } = await connected(t, { currentPane: null });
+
+  await assert.rejects(
+    () => client.sendKeysToPane('p-agent', ['not-a-herdr-key']),
+    /unsupported key/,
+  );
+});
+
+test('explicit pane text propagates RPC refusal without focused input', async (t) => {
+  const { client } = await connected(t, {
+    currentPane: null,
+    failMethods: ['pane.send_text'],
+  });
+
+  await assert.rejects(() => client.sendTextToPane('p-agent', 'hello'), /pane\.send_text refused/);
 });
 
 // ---------------------------------------------------------------------------
@@ -767,4 +814,32 @@ test('an oversized frame is dropped and the stream resyncs at the next newline',
 
   await fake.waitFor(() => seen.includes(Evt.paneUpdated));
   assert.ok(!seen.includes('junk'), 'the oversized frame must not be delivered');
+});
+
+test('a focused pane is announced without costing an agent.list', async (t) => {
+  const fake = await startFakeHerdr({ agents: [agent('p1', 'w1', 'idle')] });
+  t.onTestFinished(() => fake.stop());
+  const client = new HerdrClient(silentLogger, {
+    socketPath: fake.path,
+    ackTimeoutMs: 200,
+    requestTimeoutMs: 400,
+    refreshIntervalMs: 60_000,
+  });
+  t.onTestFinished(() => client.stop());
+
+  let moves = 0;
+  client.on('focus', () => void moves++);
+  await client.start();
+  await fake.waitFor(() => fake.requests.some((r) => r.method === 'agent.list'));
+  const listed = fake.requests.filter((r) => r.method === 'agent.list').length;
+
+  fake.push({ event: 'pane_focused', data: { pane_id: 'p1', workspace_id: 'w1' } });
+  for (let i = 0; i < 8; i++) await delay(5);
+
+  assert.equal(moves, 1, 'the event reaches its consumer');
+  assert.equal(
+    fake.requests.filter((r) => r.method === 'agent.list').length,
+    listed,
+    'and costs no round trip: focus moves far too often to spend one on each',
+  );
 });

@@ -61,6 +61,7 @@ export const Sub = {
   workspaceFocused: 'workspace.focused',
   paneCreated: 'pane.created',
   paneClosed: 'pane.closed',
+  paneFocused: 'pane.focused',
   paneUpdated: 'pane.updated',
   paneExited: 'pane.exited',
   paneAgentDetected: 'pane.agent_detected',
@@ -100,6 +101,12 @@ export const GLOBAL_SUBSCRIPTIONS: SubscriptionSpec[] = [
   { type: Sub.paneExited },
   { type: Sub.paneAgentDetected },
   { type: Sub.paneUpdated },
+  // Not topology: the harness layer acts on whatever is focused, and this is
+  // how it learns the focus moved. Without it the only way to notice was to
+  // watch the pad's own focus-moving inputs and guess, on a timer, when herdr
+  // had got round to it -- which said nothing at all about a focus changed
+  // from the keyboard or by another client.
+  { type: Sub.paneFocused },
 ];
 
 /**
@@ -128,6 +135,7 @@ export const Evt = {
   workspaceFocused: 'workspace_focused',
   paneCreated: 'pane_created',
   paneClosed: 'pane_closed',
+  paneFocused: 'pane_focused',
   paneUpdated: 'pane_updated',
   paneExited: 'pane_exited',
   paneAgentDetected: 'pane_agent_detected',
@@ -285,6 +293,16 @@ export type AgentInfo = {
   workspace_id: string;
   state_change_seq?: number;
   terminal_title_stripped?: string | null;
+  /**
+   * Required in herdr's schema (0.8.2, protocol 20), optional here on purpose.
+   *
+   * `isAgentInfo` gates every agent that reaches the pad, so adding a required
+   * field to it means a herdr build that stopped sending this one would drop
+   * all six keys to dark rather than lose the one feature that reads it. Only
+   * the harness layer reads it, and it degrades to "no focused agent" when the
+   * field is absent -- see the guard comment above isPaneInfo.
+   */
+  focused?: boolean;
 };
 
 export function isAgentInfo(v: unknown): v is AgentInfo {
@@ -377,6 +395,10 @@ export const ResultKey = {
 export const Key = {
   escape: 'esc',
   enter: 'enter',
+  up: 'up',
+  down: 'down',
+  left: 'left',
+  right: 'right',
 } as const;
 
 /**
@@ -491,7 +513,6 @@ export function reqAgentList(id: string): Request {
 export function reqWorkspaceList(id: string): Request {
   return { id, method: Method.workspaceList, params: {} };
 }
-
 export function reqWorkspaceFocus(id: string, workspaceId: string): Request {
   return { id, method: Method.workspaceFocus, params: { workspace_id: workspaceId } };
 }

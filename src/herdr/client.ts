@@ -401,6 +401,14 @@ export type HerdrClientEvents = {
   agents: (list: AgentInfo[]) => void;
   /** Authoritative workspace membership and order, from workspace.list. */
   workspaces: (list: WorkspaceInfo[]) => void;
+  /**
+   * The focused pane changed. Carries no payload on purpose: it says *when*,
+   * and whoever cares reads what they need for themselves. Unlike the other
+   * events here it triggers no refresh of its own -- focus moves far too often
+   * to spend an `agent.list` on each one, and nothing this client owns depends
+   * on it.
+   */
+  focus: () => void;
   /** Fired on every gap. Consumers must repaint from the next seed, never carry colour across. */
   disconnected: (reason: string) => void;
 };
@@ -515,7 +523,6 @@ export class HerdrClient extends EventEmitter {
   focusAgent(paneId: string): Promise<void> {
     return this.call(reqAgentFocus(`pad:focus:${paneId}`, paneId));
   }
-
   focusWorkspace(workspaceId: string): Promise<void> {
     return this.call(reqWorkspaceFocus('pad:workspace-focus', workspaceId));
   }
@@ -546,9 +553,23 @@ export class HerdrClient extends EventEmitter {
     return isRecord(pane) && typeof pane.pane_id === 'string' ? pane.pane_id : null;
   }
 
+  sendKeysToPane(paneId: string, keys: string[]): Promise<void> {
+    return this.call(reqPaneSendKeys('pad:send-keys', paneId, keys));
+  }
+
   async sendKeysToFocusedPane(keys: string[]): Promise<void> {
     const paneId = await this.currentPaneId();
-    if (paneId) await this.call(reqPaneSendKeys('pad:send-keys', paneId, keys));
+    if (paneId) await this.sendKeysToPane(paneId, keys);
+  }
+
+  /**
+   * Raw input for what the key vocabulary cannot say. Separate from
+   * sendKeysToPane rather than folded into it, because losing herdr's
+   * server-side key validation is a real cost and should be visible at the
+   * call site: this method's bytes are checked by nothing.
+   */
+  sendTextToPane(paneId: string, text: string): Promise<void> {
+    return this.call(reqPaneSendText('pad:send-text', paneId, text));
   }
 
   /**
@@ -559,7 +580,7 @@ export class HerdrClient extends EventEmitter {
    */
   async sendTextToFocusedPane(text: string): Promise<void> {
     const paneId = await this.currentPaneId();
-    if (paneId) await this.call(reqPaneSendText('pad:send-text', paneId, text));
+    if (paneId) await this.sendTextToPane(paneId, text);
   }
 
   /**
@@ -877,6 +898,11 @@ export class HerdrClient extends EventEmitter {
       if (type === Evt.paneCreated && isRecord(pane) && !pane.agent) return;
 
       await this.refreshAgents(gen);
+      return;
+    }
+
+    if (type === Evt.paneFocused) {
+      this.emit('focus');
       return;
     }
 
