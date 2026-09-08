@@ -38,14 +38,15 @@ printed on the pad, and the same names the config file binds:
 | `ACT06` | Toggle the agent popup | No |
 | `ACT07` | Send `Esc` to the focused pane | No |
 | `ACT08` / `ACT09` | Previous / next tab | No |
-| `ACT10` / `ACT11` | Unbound | No |
+| `ACT10` / `ACT11` | Nothing yet -- reserved for dictation | No |
 | `ACT12` | Send `Enter` to the focused pane | No |
-| Dial | Turn navigates, click cycles mode | Ambient ring shows the mode |
-| Joystick | Focus the pane in that direction | No |
+| Dial | Turn navigates, click cycles mode (harness included) | Ambient ring shows the mode |
+| Joystick | Focus the pane in that direction; arrow keys inside the harness layer | No |
 
 `ACT10` and `ACT11` are the two switches under the single wide keycap, so a
 press lands on one or the other; bind both to the same action if you bind
-either. The six agent keys are fixed -- only the `ACT` keys are bindable.
+either. They are unbound by default, reserved for dictation. The six agent keys
+are fixed -- only the `ACT` keys are bindable.
 
 The key LEDs carry the status. Resting states are dimmed to a quarter
 brightness so a working or blocked key stands out across the room. The glyph is
@@ -68,15 +69,18 @@ means unclassified, never an error, so it borrows idle's rather than inventing
 an alarm colour. A brief `unknown` holds the previous colour and a sustained
 one settles to idle after 2s, so it rarely reaches the keys at all.
 
-The dial cycles `workspaces → agents → scroll`; rotation navigates the active
-mode and clicking changes mode. Agent navigation is ordered by how much
-attention the agent needs (`blocked` → `done` → `working` → `idle`), so one
-turn from anywhere reaches whatever is blocked. The joystick focuses the
-adjacent pane in the direction moved. The ambient ring -- the underglow
-beneath the pad -- carries the mode, so what the dial is about to do is
-readable before it is turned: Shopify green in workspace mode, blue in agent
-mode, purple in scroll mode. All three are configurable, and a static colour
-replaces the indicator entirely.
+The dial cycles `workspaces → agents → harness`; rotation navigates the active
+mode and clicking changes mode. The third is
+[the harness layer](#the-harness-layer), which is a context rather than a
+list: rotation there pages the focused pane, and the keys act on the agent.
+Agent navigation is ordered by how much attention the agent needs (`blocked` →
+`done` → `working` → `idle`), so one turn from anywhere reaches whatever is
+blocked. The joystick focuses the adjacent pane in the direction moved. The
+ambient ring -- the underglow beneath the pad -- carries the mode, so what the
+dial is about to do is readable before it is turned: Shopify green in workspace
+mode, blue in agent mode, and in harness mode the colour of whichever harness
+is focused. All of them are configurable, and a static colour replaces the
+indicator entirely.
 
 The daemon renders the six slots as a text row on stdout and logs transitions
 and control failures to stderr, so the row stays parseable on its own.
@@ -112,6 +116,120 @@ re-import.
 The export carries no `lights` block, so importing it leaves the backlight and
 underglow as they were. The daemon drives the key LEDs and the ambient ring
 over the vendor protocol regardless of what the layer stores.
+
+## The harness layer
+
+One way in: click the dial round to `harness`. It is a mode you sit in for a
+stretch of work against one agent, and its contents come from the *harness*
+running in the focused pane -- Claude Code, pi, omp. The first layer is about
+navigation, and every control in it is a herdr operation, so it works the same
+everywhere. This one acts on the agent itself, and those controls differ per
+harness in mechanism rather than only in vocabulary: a thinking level is text
+prepended to a prompt, `/clear` is a command that applies on Enter, and
+`/model` opens a list that then has to be driven. So each harness supplies its
+own glue against a shared interface, in `src/harness/`.
+
+Today exactly one control ships, for Claude Code:
+
+| Key | Control |
+| --- | --- |
+| `ACT08` | Open the full model picker (`/model`) |
+
+Inside the layer the joystick is the four arrow keys, `ACT12` sends Enter, and
+the dial pages the focused pane. All three go to the agent, not to herdr, so a
+list can be driven and committed and its output read without leaving the mode.
+
+Scrolling used to be a dial mode of its own, which meant leaving the agent you
+were working with in order to read what it had just written. It is not a
+per-harness control -- paging a terminal is the same operation whatever is
+running in it -- so it sits beside the stick and Enter rather than in a
+harness's own list. What the dial turn used to do here, stepping agents to
+re-aim the layer, is what `AG00`-`AG05` and the tab keys are for.
+
+Those three plus whatever the harness binds are the whole claim. Everything
+else keeps its meaning: the dial click still cycles modes, and
+`ACT06`/`ACT07`/`ACT09` still open the popup, send Esc and change tab. A mode
+you sit in has no business killing the rest of the pad for as long as it is
+selected.
+
+There was briefly a second way in -- holding `ACT10` or `ACT11` for a single
+action without leaving the dial where it was. It cost more state than
+everything else in the layer put together: the wide keycap has two switches
+under it, so the layer had to track which were down, whether a cap still down
+from cancelling a picker was asking for the layer or merely resting on it, and
+whether a control press whose round trip lost the race to the release still
+counted. One door removed all of it. `ACT10` and `ACT11` are reserved for
+dictation instead, which has not landed yet.
+
+`AG00`-`AG05` keep their normal meaning inside the layer: they still focus
+their agent, and the ring follows onto whatever harness that agent runs. The
+layer acts on the *focused* agent, so swallowing them would leave it impossible
+to re-aim. Their key LEDs go on showing agent status throughout -- the layer
+never touches them.
+
+A harness with no glue -- anything but Claude Code for now -- opens an inert
+layer where every key declines, rather than borrowing another harness's
+commands and typing them at something that does not speak them.
+
+The ring says which harness the keys are about to drive: **orange** for Claude
+Code, the configured `active` colour for an unrecognised one, and **red** while
+a picker is open, because that is the one state that captures every key on the
+pad.
+
+### The picker
+
+The model picker runs `/model`, matching Claude Code's slash command rather
+than its model-switch shortcut. It is an interactive list, so once it is open
+the pad drives it: the dial moves the highlight, clicking commits -- as does a
+key bound to `enter` -- and a key bound to `escape` cancels.
+
+The dial turn is the one control that means two things. While a list is up it
+moves the highlight; the rest of the time it pages the pane. A list is the only
+thing on screen worth stepping through, and there is nothing to scroll behind
+it, so the two never want the dial at once.
+
+The joystick and Enter work anywhere in the layer, not just while a list is up,
+which is wider than the picker on purpose. The dial has one axis and a list can
+want two -- Claude Code puts the effort setting on left and right -- and
+committing one screen can put up another, by which time the pad has already
+left picker state. A push is one key press rather than one per report, so
+holding the stick moves a row and not a hundred; it re-reads from rest each
+time the stick changes hands, so a stick already leaning does not count until
+it moves. Enter goes out on the same queue as the arrows, so it cannot overtake
+the one that chose the row. `[controls.joystick]` says where a *pane* push
+should go and has nothing to say in here: a direction switched off there is
+still an arrow key.
+
+A picker holds the pad until you end it. There are four ways out, and two of
+them cannot be configured away: the dial click commits and an agent key
+abandons it on the way past, while the keys bound to `enter` and `escape`
+commit and cancel. The focus moving by any other route ends it too -- from the
+keyboard, or from another herdr client -- because herdr says when that happens
+and the layer acts on whatever is focused.
+
+While a picker is open it swallows every key except the agent keys, the two it
+drives the list with, and the stick. That is not tidiness: `ACT07` would
+otherwise reach the navigation layer, send `Esc`, close the list on screen, and
+leave the pad driving a picker that was no longer there. An agent key is the
+one thing that does get through, and it abandons the picker on the way past:
+the layer acts on the *focused* agent, and a list in a pane you have just left
+is not one the pad should still be steering.
+
+**There is no timeout.** A picker waits for you, because every way out of one is
+a single key already under a finger -- commit, cancel, or an agent key on the
+way past -- and a list being read is not an abandoned one. Expiring underneath a
+list still on screen would hand the dial back to workspace navigation without
+saying so. Cancel from the keyboard instead of the pad and the pad is left
+driving a picker that has gone: any of the ways out clears it, and since the
+dial click is one of them, clicking round to another mode ends the picker on
+the first click and changes mode on the one after.
+
+Two things the layer does not do. It never verifies that the picker actually
+opened -- it assumes, and `pane.wait_for_output` is the principled fix but it is
+screen-scraping, which is what herdr's own fallback detection does badly. And it
+does not light the keys with the layer's legend, so the agent keys go on showing
+agent status while it is held; whether the pad's `v.oai.thstatus` ids even
+address the `ACT` keys is untested.
 
 ## The popup
 
@@ -195,11 +313,10 @@ brightness = 0.5
 [underglow.dial]
 workspaces = "#95BF47"
 agents = "#2C6ECB"
-scroll = "#9C6ADE"
+harness = "#8A6A4F"
 
 [controls]
-scroll_steps = 1
-dial_mode_order = ["workspaces", "agents", "scroll"]
+dial_mode_order = ["workspaces", "agents", "harness"]
 
 [controls.bindings]
 ACT06 = "popup"
@@ -216,6 +333,13 @@ down = "pane"
 left = "pane"
 right = "pane"
 
+[harness]
+enabled = true
+scroll_steps = 1
+
+[harness.underglow]
+active = "#8A6A4F"
+
 [metrics]
 enabled = true
 ```
@@ -229,16 +353,30 @@ enabled = true
   in every mode and gives up the indicator, leaving nothing to show which mode
   the dial is in -- so set it only if you would rather the pad glowed one
   colour than read the dial.
-- **`scroll_steps`** is pages per dial detent, 1–12. Scrolling sends Page
-  Up/Page Down to the focused pane as raw terminal input, because herdr's
-  `pane.send_keys` vocabulary has no page key -- so what scrolls is whatever
-  the application in that pane does with those keys, not herdr's own
-  scrollback.
-- **`dial_mode_order`** must list every mode exactly once, or some become
-  unreachable. The first entry is the mode at startup.
+- **`dial_mode_order`** is the modes to cycle through, in order, with no
+  repeats. It does not have to name them all -- omitting one is how you drop a
+  mode you never use. The first entry is the mode at startup.
 - **Button actions**: `popup`, `escape`, `tab-prev`, `tab-next`, `enter`,
   `none`. Only the seven `ACT` keys are bindable; the agent keys are fixed.
 - **Joystick actions**: `pane` or `none`.
+- **`[harness] enabled`** turns the second layer off entirely: the layer is
+  never constructed, and `harness` is dropped from `dial_mode_order` so the
+  dial has no detent that does nothing. Scrolling goes with it -- it is a
+  control of that layer.
+- **Upgrading:** `scroll_steps` moved from `[controls]` to `[harness]`, and the
+  `scroll` dial mode became `harness`. An old `[controls] scroll_steps` is an
+  unknown key now and is ignored silently; an old `dial_mode_order` naming
+  `scroll` is rejected loudly and falls back to the default order.
+- **`[harness] scroll_steps`** is pages per dial detent, 1–12. Scrolling sends
+  Page Up/Page Down to the focused pane as raw terminal input, because herdr's
+  `pane.send_keys` vocabulary has no page key -- so what scrolls is whatever
+  the application in that pane does with those keys, not herdr's own
+  scrollback.
+- **`[harness.underglow]`** is the ring while the layer is up. `active` is the
+  fallback for a harness with no colour of its own, and what shows during the
+  round trip before the harness is known; a recognised harness overrides it.
+  Brightness comes from `[underglow] brightness`, and a static
+  `[underglow] color` still wins over all of it.
 
 ## Environment
 

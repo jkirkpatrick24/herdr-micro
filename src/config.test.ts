@@ -5,7 +5,14 @@ import { join } from 'node:path';
 import { test } from 'vitest';
 
 import { DEFAULT_CONFIG, loadConfig } from './config.js';
+import type { Logger } from './log.js';
 import { silentLogger } from './testing/fixtures.js';
+
+/** Records warnings so a test can assert a fallback was announced, not just taken. */
+function capturingLogger(): Logger & { warnings: string[] } {
+  const warnings: string[] = [];
+  return { warnings, info() {}, warn: (msg) => void warnings.push(msg), error() {} };
+}
 
 function withConfig(body: string): string {
   const dir = mkdtempSync(join(tmpdir(), 'hm-cfg-'));
@@ -37,9 +44,9 @@ test('invalid values fall back per key without rejecting the file', async (t) =>
       DEFAULT_CONFIG.underglow.brightness,
     ],
     [
-      '[underglow.dial]\nscroll = "#GG0000"',
-      (c) => c.underglow.dial.scroll,
-      DEFAULT_CONFIG.underglow.dial.scroll,
+      '[underglow.dial]\nagents = "#GG0000"',
+      (c) => c.underglow.dial.agents,
+      DEFAULT_CONFIG.underglow.dial.agents,
     ],
   ];
   for (const [body, pick, expected] of cases) {
@@ -47,6 +54,57 @@ test('invalid values fall back per key without rejecting the file', async (t) =>
     t.onTestFinished(() => rmSync(p, { force: true }));
     assert.equal(pick(await loadConfig(silentLogger, p)), expected, body);
   }
+});
+
+test('a disabled harness leaves no dead detent on the dial', async (t) => {
+  const p = withConfig('[harness]\nenabled = false\n');
+  t.onTestFinished(() => rmSync(p, { force: true }));
+
+  const cfg = await loadConfig(silentLogger, p);
+  // `enabled = false` is meant to read as "this never shipped", and a mode that
+  // cycles to nothing is the most visible way to break that.
+  assert.ok(!cfg.controls.dialModeOrder.includes('harness'));
+  assert.deepEqual(cfg.controls.dialModeOrder, ['workspaces', 'agents']);
+});
+
+test('a dial order of only harness still leaves the dial somewhere to go', async (t) => {
+  const p = withConfig('[controls]\ndial_mode_order = ["harness"]\n\n[harness]\nenabled = false\n');
+  t.onTestFinished(() => rmSync(p, { force: true }));
+
+  const log = capturingLogger();
+  const cfg = await loadConfig(log, p);
+  assert.deepEqual(cfg.controls.dialModeOrder, ['workspaces', 'agents']);
+  // The order is well formed and the layer is off; only together are they
+  // contradictory, so this is the one fallback that has to announce itself.
+  assert.ok(log.warnings.some((w) => w.includes('dial_mode_order names only harness')));
+});
+
+test('a partial dial order is a choice, not a typo', async (t) => {
+  const p = withConfig('[controls]\ndial_mode_order = ["agents", "harness"]\n');
+  t.onTestFinished(() => rmSync(p, { force: true }));
+
+  // It used to demand every mode exactly once. With `harness` optional, an
+  // order that omits modes is something a user can mean.
+  const cfg = await loadConfig(silentLogger, p);
+  assert.deepEqual(cfg.controls.dialModeOrder, ['agents', 'harness']);
+});
+
+test('an empty dial order is rejected, not honoured', async (t) => {
+  const p = withConfig('[controls]\ndial_mode_order = []\n');
+  t.onTestFinished(() => rmSync(p, { force: true }));
+
+  // Honouring it would leave the dial with nothing to cycle to: `handleDial`
+  // computes the next index modulo the length, and modulo zero is NaN.
+  const cfg = await loadConfig(silentLogger, p);
+  assert.deepEqual(cfg.controls.dialModeOrder, DEFAULT_CONFIG.controls.dialModeOrder);
+});
+
+test('a dial order with a repeat is still rejected', async (t) => {
+  const p = withConfig('[controls]\ndial_mode_order = ["agents", "agents", "harness"]\n');
+  t.onTestFinished(() => rmSync(p, { force: true }));
+
+  const cfg = await loadConfig(silentLogger, p);
+  assert.deepEqual(cfg.controls.dialModeOrder, DEFAULT_CONFIG.controls.dialModeOrder);
 });
 
 test('valid values are honoured', async (t) => {
@@ -59,12 +117,11 @@ test('valid values are honoured', async (t) => {
 
 test('control settings are configurable', async (t) => {
   const p = withConfig(
-    '[controls]\nscroll_steps = 3\ndial_mode_order = ["scroll", "agents", "workspaces"]\n\n[controls.bindings]\nACT06 = "none"\nACT12 = "escape"\n\n[controls.joystick]\nleft = "none"\n',
+    '[controls]\ndial_mode_order = ["harness", "agents", "workspaces"]\n\n[controls.bindings]\nACT06 = "none"\nACT12 = "escape"\n\n[controls.joystick]\nleft = "none"\n',
   );
   t.onTestFinished(() => rmSync(p, { force: true }));
   const cfg = await loadConfig(silentLogger, p);
-  assert.equal(cfg.controls.scrollSteps, 3);
-  assert.deepEqual(cfg.controls.dialModeOrder, ['scroll', 'agents', 'workspaces']);
+  assert.deepEqual(cfg.controls.dialModeOrder, ['harness', 'agents', 'workspaces']);
   assert.equal(cfg.controls.buttons.ACT06, 'none');
   assert.equal(cfg.controls.buttons.ACT12, 'escape');
   assert.equal(cfg.controls.joystick.left, 'none');

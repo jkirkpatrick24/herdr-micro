@@ -102,22 +102,22 @@ test('dial click cycles modes and reports each one to its listener', async (t) =
   controls.handle({ kind: 'dial', action: 'click' });
   controls.handle({ kind: 'dial', action: 'click' });
 
-  assert.deepEqual(modes, ['agents', 'scroll']);
-  assert.equal(controls.dialMode, 'scroll');
+  assert.deepEqual(modes, ['agents', 'harness']);
+  assert.equal(controls.dialMode, 'harness');
 });
 
 test('dial click wraps back to the first configured mode', async (t) => {
   const { controls, modes } = await pad(
     t,
     {},
-    { controls: { dialModeOrder: ['scroll', 'agents'] } },
+    { controls: { dialModeOrder: ['harness', 'agents'] } },
   );
 
-  assert.equal(controls.dialMode, 'scroll');
+  assert.equal(controls.dialMode, 'harness');
   controls.handle({ kind: 'dial', action: 'click' });
   controls.handle({ kind: 'dial', action: 'click' });
 
-  assert.deepEqual(modes, ['agents', 'scroll']);
+  assert.deepEqual(modes, ['agents', 'harness']);
 });
 
 // ---------------------------------------------------------------------------
@@ -343,28 +343,22 @@ test('agent mode gives up before asking which pane is current when there are non
 // Scroll mode and key sending
 // ---------------------------------------------------------------------------
 
-test('scroll mode sends one page key per configured step to the focused pane', async (t) => {
-  const { controls, awaitCalls } = await pad(
-    t,
-    { currentPane: 'p1' },
-    { controls: { scrollSteps: 3 } },
-  );
+test('a harness-mode turn does nothing here, because the layer already took it', async (t) => {
+  const { controls, expectMethods } = await pad(t, {
+    agents: [agent('p1', 'w1', 'idle'), agent('p2', 'w1', 'blocked')],
+    currentPane: 'p1',
+  });
 
-  controls.handle({ kind: 'dial', action: 'click' });
-  controls.handle({ kind: 'dial', action: 'click' });
-  controls.handle({ kind: 'dial', action: 'counterclockwise' });
-  await awaitCalls('pane.send_text', 1);
+  // The harness layer scrolls the focused pane with its dial turns and consumes
+  // them, so PadControls never sees one through `harnessSurface`. Reaching here
+  // anyway must be inert: this used to page the pane, which scrolled the agent
+  // the user was about to send a command to.
+  controls.handle({ kind: 'dial', action: 'click' }); // agents
+  controls.handle({ kind: 'dial', action: 'click' }); // harness
+  assert.equal(controls.dialMode, 'harness');
+
   controls.handle({ kind: 'dial', action: 'clockwise' });
-  const sent = await awaitCalls('pane.send_text', 2);
-
-  // send_text rather than send_keys, and the literal escape sequences rather
-  // than a key name: herdr has no page key to ask for. Asserted as bytes
-  // because that is the whole content of the fix -- a name here would be
-  // checked by nothing, which is how `pageup` survived.
-  assert.deepEqual(sent, [
-    { pane_id: 'p1', text: '\x1b[6~\x1b[6~\x1b[6~' },
-    { pane_id: 'p1', text: '\x1b[5~\x1b[5~\x1b[5~' },
-  ]);
+  await expectMethods();
 });
 
 test('the key names the daemon sends are ones herdr accepts', async (t) => {
@@ -636,18 +630,39 @@ test('a held joystick keeps its sector without falling through the release ring'
   assert.deepEqual(directions, [{ direction: 'right' }, { direction: 'left' }]);
 });
 
-test('changing dial mode re-arms the joystick', async (t) => {
-  const { controls, awaitCalls } = await pad(t);
+test('changing dial mode does not replay a held joystick position', async (t) => {
+  const { controls, awaitCalls, expectMethods } = await pad(t);
 
   controls.handle({ kind: 'joystick', angle: 0, distance: 0.9 });
   await awaitCalls('pane.focus_direction', 1);
 
-  // Without the re-arm the held sector would swallow the second push.
   controls.handle({ kind: 'dial', action: 'click' });
   controls.handle({ kind: 'joystick', angle: 0, distance: 0.9 });
-  const directions = await awaitCalls('pane.focus_direction', 2);
+  await expectMethods('pane.focus_direction');
 
+  controls.handle({ kind: 'joystick', angle: 0, distance: 0 });
+  controls.handle({ kind: 'joystick', angle: 0, distance: 0.9 });
+  const directions = await awaitCalls('pane.focus_direction', 2);
   assert.deepEqual(directions, [{ direction: 'right' }, { direction: 'right' }]);
+});
+
+test('consumed joystick reports keep navigation aligned across ownership changes', async (t) => {
+  const { controls, awaitCalls, expectMethods } = await pad(t);
+
+  controls.handle({ kind: 'joystick', angle: 0, distance: 0.9 });
+  await awaitCalls('pane.focus_direction', 1);
+
+  // The layer owns this push left. Giving it back while held must not move a pane.
+  controls.handle({ kind: 'joystick', angle: 0.5, distance: 0.9 }, true);
+  controls.handle({ kind: 'joystick', angle: 0.5, distance: 0.9 });
+  await expectMethods('pane.focus_direction');
+
+  // A release while owned must still re-arm navigation for a genuinely new push.
+  controls.handle({ kind: 'joystick', angle: 0.5, distance: 0 }, true);
+  controls.handle({ kind: 'joystick', angle: 0.5, distance: 0.9 });
+  const directions = await awaitCalls('pane.focus_direction', 2);
+  await expectMethods('pane.focus_direction', 'pane.focus_direction');
+  assert.deepEqual(directions, [{ direction: 'right' }, { direction: 'left' }]);
 });
 
 test('a joystick direction mapped away from pane focus is ignored', async (t) => {

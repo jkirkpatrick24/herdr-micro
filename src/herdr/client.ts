@@ -573,17 +573,6 @@ export class HerdrClient extends EventEmitter {
   }
 
   /**
-   * Raw input for what the key vocabulary cannot say. Separate from
-   * sendKeysToFocusedPane rather than folded into it, because losing herdr's
-   * server-side key validation is a real cost and should be visible at the
-   * call site: this method's bytes are checked by nothing.
-   */
-  async sendTextToFocusedPane(text: string): Promise<void> {
-    const paneId = await this.currentPaneId();
-    if (paneId) await this.sendTextToPane(paneId, text);
-  }
-
-  /**
    * There is no toggle method, so this probes: close whatever popup is open,
    * and if there was none, open ours. The notification is the last resort for
    * a standalone install with no plugin pane registered.

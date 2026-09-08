@@ -1,21 +1,10 @@
-import type { ControlConfig, DialMode, Direction } from '../config.js';
+import type { ControlConfig, DialMode } from '../config.js';
 import type { HerdrClient } from '../herdr/client.js';
-import { Key, PageKey } from '../herdr/rpc.js';
+import { Key } from '../herdr/rpc.js';
 import { type Logger, reason } from '../log.js';
 import type { Store } from '../state/store.js';
+import { ArrowStick } from './joystick.js';
 import type { PadInput } from './protocol.js';
-
-// Creator Micro 2 reports a full deflection around 0.43; House's Codex
-// firmware uses a different scale and its 0.75 threshold is too high here.
-// Engaging further out than it releases stops a resting stick from chattering.
-const ENGAGE_DISTANCE = 0.25;
-const RELEASE_DISTANCE = 0.1;
-
-/**
- * Joystick sectors, clockwise from angle 0. The angle is a fraction of a full
- * turn, so 0 is right, 0.25 down, and so on; array position IS the mapping.
- */
-const SECTORS: Direction[] = ['right', 'down', 'left', 'up'];
 
 /** Agent navigation order: the agent most in need of a human comes first. */
 const ATTENTION: Record<string, number> = { blocked: 4, done: 3, working: 2, idle: 1 };
@@ -23,8 +12,8 @@ const ATTENTION: Record<string, number> = { blocked: 4, done: 3, working: 2, idl
 /** Turns pad input into herdr commands. Every action is best-effort. */
 export class PadControls {
   private mode: DialMode;
-  /** The sector the stick is currently in, or null while it rests near centre. */
-  private lastSector: number | null = null;
+  /** Navigation owns the stick by default; the harness layer borrows it. */
+  private readonly stick = new ArrowStick();
 
   constructor(
     private readonly client: HerdrClient,
@@ -40,11 +29,15 @@ export class PadControls {
     return this.mode;
   }
 
-  handle(input: PadInput): void {
+  /** Consumed joystick reports still update position, but never move a pane. */
+  handle(input: PadInput, consumed = false): void {
     try {
-      if (input.kind === 'key') this.handleKey(input.key, input.pressed);
-      else if (input.kind === 'dial') this.handleDial(input.action);
-      else this.handleJoystick(input.angle, input.distance);
+      if (input.kind === 'joystick') {
+        this.handleJoystick(input.angle, input.distance, consumed);
+      } else if (!consumed) {
+        if (input.kind === 'key') this.handleKey(input.key, input.pressed);
+        else this.handleDial(input.action);
+      }
     } catch (error) {
       this.log.warn('pad control failed', { reason: reason(error) });
     }
@@ -90,8 +83,6 @@ export class PadControls {
       const index = order.indexOf(this.mode);
 
       this.mode = order[(index + 1) % order.length] ?? 'workspaces';
-      // The stick's sector is mode-relative; forget it so the next nudge acts.
-      this.lastSector = null;
 
       this.onModeChange(this.mode);
       this.log.info('dial mode changed', { mode: this.mode });
@@ -101,16 +92,25 @@ export class PadControls {
     // Clockwise steps backwards through the lists, matching the pad's legend.
     const step = action === 'clockwise' ? -1 : 1;
 
-    if (this.mode === 'workspaces') void this.run('workspace navigation', this.stepWorkspace(step));
-    else if (this.mode === 'agents') void this.run('agent navigation', this.stepAgent(step));
-    else {
-      // Raw bytes rather than a named key: herdr's send_keys vocabulary has no
-      // page key, so this is the only way to page a pane. See PageKey.
-      const page = step > 0 ? PageKey.down : PageKey.up;
-      void this.run(
-        'scroll',
-        this.client.sendTextToFocusedPane(page.repeat(this.settings.scrollSteps)),
-      );
+    switch (this.mode) {
+      case 'workspaces':
+        void this.run('workspace navigation', this.stepWorkspace(step));
+        break;
+      case 'agents':
+        void this.run('agent navigation', this.stepAgent(step));
+        break;
+      // The harness layer scrolls the focused pane with its own dial turns and
+      // consumes them, so one never reaches here through `harnessSurface`.
+      // Named anyway, so the exhaustive check below stays a compile error for a
+      // mode nobody handled rather than for this one.
+      case 'harness':
+        break;
+      default: {
+        // A new DialMode is a compile error here rather than a dial that turns
+        // and quietly does the last branch's job.
+        const unhandled: never = this.mode;
+        this.log.warn('dial mode has no turn behaviour', { mode: unhandled });
+      }
     }
   }
 
@@ -118,24 +118,13 @@ export class PadControls {
    * The stick streams a continuous position, so this fires once per sector
    * entered: holding it in one direction moves one pane, not hundreds.
    */
-  private handleJoystick(angle: number, distance: number): void {
-    if (distance <= RELEASE_DISTANCE) {
-      this.lastSector = null;
-      return;
-    }
-
-    // Engaging needs a deliberate push; staying engaged needs much less.
-    if (this.lastSector === null && distance < ENGAGE_DISTANCE) return;
-
-    const sector = sectorFor(angle);
-    if (sector === this.lastSector) return;
-    this.lastSector = sector;
-
-    // Checked rather than asserted. sectorFor is total, so this cannot fire --
-    // but the alternative is a `!` standing in for an invariant one arithmetic
-    // edit could break, and the failure it hid was a silently dropped push.
-    const direction = SECTORS[sector];
-    if (!direction || this.settings.joystick[direction] !== 'pane') return;
+  private handleJoystick(angle: number, distance: number, consumed: boolean): void {
+    // Read first and act second: a consumed report still has to move the
+    // stick's position, or handing it back would replay a direction already
+    // held. `true` because this is the reader the stick belongs to by default.
+    const direction = this.stick.read(angle, distance, true);
+    if (consumed || !direction) return;
+    if (this.settings.joystick[direction] !== 'pane') return;
 
     this.log.info('joystick pane focus requested', { angle, distance, direction });
     void this.run('pane navigation', this.client.focusPaneDirection(direction));
@@ -201,22 +190,6 @@ export class PadControls {
       this.log.warn(`${label} failed`, { reason: reason(error) });
     }
   }
-}
-
-/**
- * The sector an angle falls in, rounding to the nearest and wrapping at both
- * ends.
- *
- * The angle arrives unnormalised -- protocol.ts forwards whatever finite number
- * the pad reports -- so it is normalised into [0, 1) first. Taking the modulo
- * of the sector alone is not enough: JavaScript's `%` keeps the sign, so a
- * signed angle produced a negative index and the push was dropped rather than
- * acted on. Up, left and down were all unreachable that way, and the drop was
- * silent.
- */
-function sectorFor(angle: number): number {
-  const turns = ((angle % 1) + 1) % 1;
-  return Math.round(turns * SECTORS.length) % SECTORS.length;
 }
 
 /** Step through `items`, wrapping at both ends. */

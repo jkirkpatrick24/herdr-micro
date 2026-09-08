@@ -3,7 +3,13 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { parse as parseToml } from 'smol-toml';
 
-import { isOneOf, isRecord } from './json.js';
+import { isHex, overlay, pick, section } from './config-values.js';
+import {
+  DEFAULT_HARNESS_CONFIG,
+  type HarnessConfig,
+  resolveHarnessConfig,
+} from './harness/config.js';
+import { isOneOf } from './json.js';
 import { type Logger, reason } from './log.js';
 
 export const CONFIG_PATH = join(homedir(), '.config', 'herdr-micro', 'config.toml');
@@ -17,7 +23,7 @@ export const COLOR_KEYS = ['idle', 'working', 'done', 'blocked'] as const;
 
 export type ColorConfig = Record<(typeof COLOR_KEYS)[number], string>;
 
-export const DIAL_MODES = ['workspaces', 'agents', 'scroll'] as const;
+export const DIAL_MODES = ['workspaces', 'agents', 'harness'] as const;
 export const CONTROL_ACTIONS = [
   'popup',
   'escape',
@@ -35,7 +41,6 @@ export type JoystickAction = (typeof JOYSTICK_ACTIONS)[number];
 export type Direction = (typeof DIRECTIONS)[number];
 
 export type ControlConfig = {
-  scrollSteps: number;
   dialModeOrder: DialMode[];
   buttons: Record<string, ControlAction>;
   joystick: Record<Direction, JoystickAction>;
@@ -55,6 +60,8 @@ export type Config = {
   colors: ColorConfig;
   controls: ControlConfig;
   underglow: UnderglowConfig;
+  /** The second layer. Resolved in src/harness/config.ts, which owns its shape. */
+  harness: HarnessConfig;
   metricsEnabled: boolean;
 };
 
@@ -66,13 +73,14 @@ export const DEFAULT_CONFIG: Config = Object.freeze<Config>({
     blocked: '#C87A0A',
   },
   controls: {
-    scrollSteps: 1,
-    dialModeOrder: ['workspaces', 'agents', 'scroll'],
+    dialModeOrder: ['workspaces', 'agents', 'harness'],
     buttons: {
       ACT06: 'popup',
       ACT07: 'escape',
       ACT08: 'tab-prev',
       ACT09: 'tab-next',
+      // The two switches under the wide keycap. Reserved for dictation, which
+      // has not landed yet -- bind them yourself in the meantime.
       ACT10: 'none',
       ACT11: 'none',
       ACT12: 'enter',
@@ -82,19 +90,18 @@ export const DEFAULT_CONFIG: Config = Object.freeze<Config>({
   underglow: {
     color: null,
     brightness: 0.5,
-    // Shopify's palette: the logo green, then Polaris blue and purple. Three
-    // Shopify greens would be truer to the brand and unreadable on a diffused
-    // ring at half brightness, which is the whole job of the indicator.
-    dial: { workspaces: '#95BF47', agents: '#2C6ECB', scroll: '#9C6ADE' },
+    // Shopify's palette: the logo green, then Polaris blue. Three Shopify
+    // greens would be truer to the brand and unreadable on a diffused ring at
+    // half brightness, which is the whole job of the indicator.
+    //
+    // `harness` is the odd one out and is nearly always painted over: the layer
+    // shows the focused harness's own colour instead. It is what the ring falls
+    // back to before that resolves, so it matches `[harness.underglow] active`.
+    dial: { workspaces: '#95BF47', agents: '#2C6ECB', harness: '#8A6A4F' },
   },
+  harness: DEFAULT_HARNESS_CONFIG,
   metricsEnabled: true,
 });
-
-const HEX = /^#[0-9a-fA-F]{6}$/;
-
-function isHex(v: unknown): v is string {
-  return typeof v === 'string' && HEX.test(v);
-}
 
 /**
  * All keys optional; anything missing or malformed falls back to the default.
@@ -125,10 +132,13 @@ export async function loadConfig(log: Logger, path = CONFIG_PATH): Promise<Confi
   const colors = section(parsed, 'colors');
   const controls = section(parsed, 'controls');
 
+  const harness = resolveHarnessConfig(section(parsed, 'harness'), log);
+
   const config: Config = {
     colors: overlay(colors, DEFAULT_CONFIG.colors, COLOR_KEYS, log, isHex),
-    controls: resolveControls(controls, log),
+    controls: resolveControls(controls, log, harness.enabled),
     underglow: resolveUnderglow(section(parsed, 'underglow'), log),
+    harness,
     metricsEnabled: pick(
       section(parsed, 'metrics'),
       'enabled',
@@ -142,11 +152,19 @@ export async function loadConfig(log: Logger, path = CONFIG_PATH): Promise<Confi
   return config;
 }
 
-function resolveControls(obj: Record<string, unknown>, log: Logger): ControlConfig {
+function resolveControls(
+  obj: Record<string, unknown>,
+  log: Logger,
+  harnessEnabled: boolean,
+): ControlConfig {
   const defaults = DEFAULT_CONFIG.controls;
+  const order = pick(obj, 'dial_mode_order', defaults.dialModeOrder, log, isDialModeOrder);
+
   return {
-    scrollSteps: pick(obj, 'scroll_steps', defaults.scrollSteps, log, isScrollSteps),
-    dialModeOrder: [...pick(obj, 'dial_mode_order', defaults.dialModeOrder, log, isDialModeOrder)],
+    // A disabled layer must not leave a mode in the cycle that does nothing --
+    // `[harness] enabled = false` is meant to read as "this never shipped", and
+    // a dead detent on the dial is the most visible way to break that promise.
+    dialModeOrder: withoutDisabledHarness(order, harnessEnabled, log),
     buttons: overlay(
       section(obj, 'bindings'),
       defaults.buttons,
@@ -174,23 +192,22 @@ function resolveUnderglow(obj: Record<string, unknown>, log: Logger): UnderglowC
 }
 
 // -- Validators. Each answers "is this value usable?", never "is it correct?" --
+//
+// The generic ones -- isHex, section, pick, overlay -- live in config-values.ts
+// so that src/harness/config.ts can resolve its own section without importing
+// this module back. See the note there.
 
-/** Every mode exactly once: a partial order would make some modes unreachable. */
+/**
+ * A non-empty set of distinct modes. An omitted mode is unreachable, which is
+ * a choice the user is allowed to make -- and one made for them when
+ * `[harness] enabled` is false. A duplicate is not: a mode reached twice per
+ * cycle is nothing anyone means.
+ */
 function isDialModeOrder(v: unknown): v is DialMode[] {
-  return (
-    Array.isArray(v) &&
-    v.length === DIAL_MODES.length &&
-    new Set(v).size === DIAL_MODES.length &&
-    v.every(isDialMode)
-  );
+  return Array.isArray(v) && v.length > 0 && new Set(v).size === v.length && v.every(isDialMode);
 }
 
 const isDialMode = oneOf(DIAL_MODES);
-
-/** One dial detent sends this many page keys. Capped to keep a nudge sane. */
-function isScrollSteps(v: unknown): v is number {
-  return typeof v === 'number' && Number.isInteger(v) && v >= 1 && v <= 12;
-}
 
 /** Unset means "show the dial mode", so absent is a value here rather than a gap. */
 function isHexOrNull(v: unknown): v is string | null {
@@ -202,55 +219,31 @@ function isBrightness(v: unknown): v is number {
   return typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= 1;
 }
 
+/**
+ * `harness` removed when the layer is switched off, unless that would leave the
+ * dial with no modes at all -- an order of exactly `["harness"]` is a config the
+ * user can write, and an empty cycle would strand the dial rather than honour it.
+ */
+function withoutDisabledHarness(
+  order: readonly DialMode[],
+  enabled: boolean,
+  log: Logger,
+): DialMode[] {
+  if (enabled) return [...order];
+
+  const kept = order.filter((mode) => mode !== 'harness');
+  if (kept.length > 0) return kept;
+
+  // Every other fallback in this file is either absent-and-silent or
+  // present-but-wrong-and-loud. This one is neither: the order is well formed
+  // and the layer is switched off, and the two are only contradictory together.
+  // Handing back an order the user never wrote is worth saying out loud.
+  const using = DEFAULT_CONFIG.controls.dialModeOrder.filter((m) => m !== 'harness');
+  log.warn('dial_mode_order names only harness, which is disabled', { using });
+  return using;
+}
+
 /** Builds a type guard for a fixed set of allowed strings. */
 function oneOf<T extends string>(allowed: readonly T[]): (v: unknown) => v is T {
   return (v): v is T => isOneOf(allowed, v);
-}
-
-/** A TOML table, or an empty one so callers never branch on its absence. */
-function section(obj: Record<string, unknown>, key: string): Record<string, unknown> {
-  const v = obj[key];
-  return isRecord(v) ? v : {};
-}
-
-/**
- * One key, validated: absent falls back silently, present-but-wrong falls back
- * loudly. A bad value must never reject the whole file -- a typo in one colour
- * should not cost the user every other setting.
- */
-function pick<T>(
-  obj: Record<string, unknown>,
-  key: string,
-  fallback: T,
-  log: Logger,
-  valid: (v: unknown) => v is T,
-): T {
-  const v = obj[key];
-
-  if (v === undefined) return fallback;
-  if (valid(v)) return v;
-
-  log.warn('ignoring invalid config value', { key, value: v, using: fallback });
-  return fallback;
-}
-
-/**
- * The same, for a whole table. `keys` is the key set, so an unknown key in the
- * file is ignored rather than carried into the config.
- *
- * The keys are passed in rather than recovered from `Object.keys`, which is
- * typed `string[]` -- deliberately, since a value may carry properties its type
- * never declared. Naming the set is what makes this readable without a cast,
- * and it is the same list the validators are built from.
- */
-function overlay<K extends string, T extends string>(
-  obj: Record<string, unknown>,
-  defaults: Record<K, T>,
-  keys: readonly K[],
-  log: Logger,
-  valid: (v: unknown) => v is T,
-): Record<K, T> {
-  const out = { ...defaults };
-  for (const key of keys) out[key] = pick(obj, key, out[key], log, valid);
-  return out;
 }

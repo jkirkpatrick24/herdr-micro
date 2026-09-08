@@ -22,8 +22,18 @@ export function renderSlotLighting(view: SlotView[], config: Config): ThreadLigh
  * holds one colour and gives the indicator up.
  */
 export function ambientLighting(config: Config, mode: DialMode = 'workspaces'): AmbientLighting {
-  const { color, brightness, dial } = config.underglow;
-  const value = colorToNumber(color ?? dial[mode]);
+  return ringLighting(config, config.underglow.dial[mode]);
+}
+
+/**
+ * The ring at an arbitrary colour, for indicators the dial mode does not name
+ * -- the harness layer paints its own. A static `[underglow] color` still wins
+ * and still gives up every indicator: that is what setting it means, and an
+ * exception here would make it mean something narrower.
+ */
+export function ringLighting(config: Config, color: string): AmbientLighting {
+  const { brightness } = config.underglow;
+  const value = colorToNumber(config.underglow.color ?? color);
 
   if (value === 0) return RING_OFF;
   return { color: value, brightness, effect: 1, speed: 0, magic: 0 };

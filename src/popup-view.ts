@@ -31,7 +31,7 @@ const STATUS_COLORS: Record<AgentStatus, string> = {
 const TITLE = 'Agent status';
 const HINTS = [
   'Keys focus agents · ACT07 Esc · ACT08/09 tabs · ACT12 Enter',
-  'Dial: workspaces / agents / scroll · Joystick: pane focus',
+  'Dial: workspaces / agents / harness · Joystick: pane focus',
   'Press q or Esc to close',
 ];
 const EMPTY_LABEL = 'empty';
